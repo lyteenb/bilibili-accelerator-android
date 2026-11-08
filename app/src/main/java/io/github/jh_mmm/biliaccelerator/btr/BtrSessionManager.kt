@@ -139,25 +139,27 @@ object BtrSessionManager {
 
         val host = uri.host.lowercase()
         val isAkamai = host.endsWith(".akamaized.net")
-        // 对齐 BTR：当海外账号仅分发 akamaized.net 节点时，支持提取其签名合成海外专属 ov 镜像，恢复多源并发能力
-        val isOverseasStream = host.contains("ov.bilivideo.com") || isAkamai || BiliAcceleratorCore.isOverseasEnvironment()
+        val isExplicitOverseas = host.contains("ov.bilivideo.com") ||
+            isAkamai ||
+            host.endsWith(".bstarstatic.com")
+        val isExplicitMainland = BiliAcceleratorCore.isBiliCdnHost(host) && !isExplicitOverseas
+        val isOverseasStream = when {
+            isExplicitOverseas -> true
+            isExplicitMainland -> false
+            else -> BiliAcceleratorCore.isOverseasEnvironment()
+        }
 
-        val candidateList = if (config != null) {
-            BiliAcceleratorCore.getEffectiveCdnPool(config)
+        val customPool = config?.customCdnPool
+            ?.filter { BiliAcceleratorCore.isOfficialBiliHost(it) }
+            ?.distinct()
+            .orEmpty()
+        val useCustomPool = customPool.isNotEmpty()
+        val candidateList = if (useCustomPool) {
+            BiliAcceleratorCore.getEffectiveCdnPool(config ?: return emptyList())
         } else if (isOverseasStream) {
-            listOf(
-                "upos-sz-mirrorcosov.bilivideo.com",
-                "upos-sz-mirroraliov.bilivideo.com",
-                "upos-sz-mirrorhwov.bilivideo.com"
-            )
+            BiliAcceleratorCore.OVERSEAS_CANDIDATE_POOL
         } else {
-            listOf(
-                "upos-sz-mirrorcos.bilivideo.com",
-                "upos-sz-mirrorali.bilivideo.com",
-                "upos-sz-mirrorhw.bilivideo.com",
-                "upos-tf-all-tx.bilivideo.com",
-                "upos-tf-all-hw.bilivideo.com"
-            )
+            BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL
         }
 
         val maxBackups = if (config != null) config.btrCdnPoolSize.coerceIn(1, candidateList.size) else 3
@@ -165,9 +167,13 @@ object BtrSessionManager {
         for (m in candidateList) {
             val cleanM = BiliAcceleratorCore.cleanHost(m).lowercase()
             if (cleanM == host || cleanM.endsWith(".akamaized.net")) continue
-            // 严格隔离：海外 ov 节点仅在海外主地址时合成，大陆节点仅在大陆主地址时合成，防止区域鉴权 403
-            val candidateIsOv = cleanM.contains("ov.bilivideo.com")
-            if (isOverseasStream != candidateIsOv) continue
+            if (!useCustomPool) {
+                // Default pools must stay in the same regional family as the
+                // primary URL. User-supplied official pools are explicit and
+                // therefore keep their user-selected regional set.
+                val candidateIsOv = cleanM.contains("ov.bilivideo.com")
+                if (isOverseasStream != candidateIsOv) continue
+            }
 
             results.add(uri.replaceAuthority(cleanM))
             if (results.size >= maxBackups) break

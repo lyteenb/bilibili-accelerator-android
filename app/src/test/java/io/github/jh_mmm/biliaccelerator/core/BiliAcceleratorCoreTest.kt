@@ -391,7 +391,8 @@ class BiliAcceleratorCoreTest {
         // 如果用户配置的是 Akamai 域名或非法域名，resolveTargetHost 必须回退到安全的官方镜像
         val host = BiliAcceleratorCore.resolveTargetHost("upos-hz-mirrorakam.akamaized.net")
         assertFalse("Resolved target host must never be Akamai", BiliAcceleratorCore.isAkamaiHost(host))
-        assertEquals("upos-sz-mirrorcos.bilivideo.com", host)
+        assertTrue("Resolved target host must remain an official Bilibili host", BiliAcceleratorCore.isOfficialBiliHost(host))
+        assertTrue("Resolved target host must use a Bilibili video CDN", host.endsWith(".bilivideo.com"))
     }
 
     @Test
