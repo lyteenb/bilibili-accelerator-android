@@ -102,6 +102,7 @@ class StatsProvider : ContentProvider() {
         const val KEY_BTR_CHUNK_SIZE_KB = "cfg_btr_chunk_size_kb"
         const val KEY_CUSTOM_CDN_POOL = "cfg_custom_cdn_pool"
         const val KEY_BTR_CDN_POOL_SIZE = "cfg_btr_cdn_pool_size"
+        const val KEY_ENABLE_EPISODE_ACCELERATION = "cfg_enable_episode_acceleration"
         const val KEY_ENABLE_DEBUG_LOGGING = "cfg_enable_debug_logging"
 
         private val gson = Gson()
@@ -159,10 +160,11 @@ class StatsProvider : ContentProvider() {
                 btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
                 btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512).coerceIn(128, 2048),
                 customCdnPool = customPool
-                    .filter { BiliAcceleratorCore.isOfficialBiliHost(it) }
+                    .filter { BiliAcceleratorCore.isBiliCdnHost(it) && !BiliAcceleratorCore.isAkamaiHost(it) }
                     .distinct()
                     .take(32),
                 btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8).coerceIn(1, 32),
+                enableEpisodeAcceleration = sp.getBoolean(KEY_ENABLE_EPISODE_ACCELERATION, true),
                 enableDebugLogging = sp.getBoolean(KEY_ENABLE_DEBUG_LOGGING, false)
             )
             return config.copy(proxyHost = BiliAcceleratorCore.resolveProxyHost(config))
@@ -188,6 +190,7 @@ class StatsProvider : ContentProvider() {
                 .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
                 .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(config.customCdnPool))
                 .putInt(KEY_BTR_CDN_POOL_SIZE, config.btrCdnPoolSize)
+                .putBoolean(KEY_ENABLE_EPISODE_ACCELERATION, config.enableEpisodeAcceleration)
                 .putBoolean(KEY_ENABLE_DEBUG_LOGGING, config.enableDebugLogging)
                 .apply()
             io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(config.enableDebugLogging)

@@ -20,6 +20,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
+internal enum class BtrDirectPipeResult {
+    COMPLETED,
+    FAILED_BEFORE_RESPONSE,
+    FAILED_AFTER_RESPONSE
+}
+
 object BtrChunkEngine {
 
     private const val TAG = "BiliAccelerator-BTR"
@@ -54,33 +60,44 @@ object BtrChunkEngine {
     private val globalDispatcherPool = Executors.newFixedThreadPool(16) { r ->
         Thread(r, "BTR-Dispatcher").apply { isDaemon = true }
     }
-    private val sessionActiveCalls = ConcurrentHashMap<String, MutableSet<Call>>()
-
-    private fun registerSessionCall(sessionId: String, call: Call) {
-        sessionActiveCalls.computeIfAbsent(sessionId) { ConcurrentHashMap.newKeySet() }.add(call)
-    }
-
-    private fun unregisterSessionCall(sessionId: String, call: Call) {
-        sessionActiveCalls[sessionId]?.remove(call)
-    }
-
-    private fun cancelSessionCalls(sessionId: String) {
-        sessionActiveCalls.remove(sessionId)?.forEach { call ->
-            runCatching { call.cancel() }
-        }
-    }
+    private val activeCalls = BtrCallRegistry()
 
     internal fun cancelAllSessions() {
-        sessionActiveCalls.keys.toList().forEach { cancelSessionCalls(it) }
+        activeCalls.cancelAll()
     }
 
-    private inline fun <T> executeWithTracking(sessionId: String, call: Call, block: (okhttp3.Response) -> T): T {
-        registerSessionCall(sessionId, call)
+    private inline fun <T> executeWithTracking(
+        streamCallKey: String,
+        sessionId: String,
+        call: Call,
+        block: (okhttp3.Response) -> T
+    ): T {
+        activeCalls.register(streamCallKey, sessionId, call)
         return try {
             call.execute().use(block)
         } finally {
-            unregisterSessionCall(sessionId, call)
+            activeCalls.unregister(streamCallKey, call)
         }
+    }
+
+    internal fun registerActiveCallForTesting(sessionId: String, call: Call): String {
+        val streamCallKey = activeCalls.newStreamCallKey(sessionId)
+        activeCalls.register(streamCallKey, sessionId, call)
+        return streamCallKey
+    }
+
+    internal fun cancelStreamCallsForTesting(streamCallKey: String) {
+        activeCalls.cancelStreamCalls(streamCallKey)
+    }
+
+    internal fun unregisterActiveCallForTesting(streamCallKey: String, call: Call) {
+        activeCalls.unregister(streamCallKey, call)
+    }
+
+    internal fun activeStreamCallCountForTesting(): Int = activeCalls.activeStreamCount()
+
+    internal fun hasSessionStreamKeyForTesting(sessionId: String): Boolean {
+        return activeCalls.hasSessionStreamKey(sessionId)
     }
 
     data class ChunkTask(
@@ -98,7 +115,8 @@ object BtrChunkEngine {
         val primaryHost: String,
         @Volatile var concurrency: Int,
         @Volatile var burstConcurrency: Int,
-        val proxyPort: Int
+        val proxyPort: Int,
+        val isEpisode: Boolean = false
     ) {
         val totalChunks = AtomicInteger(0)
         val totalBytes = AtomicLong(0L)
@@ -120,7 +138,11 @@ object BtrChunkEngine {
             val avgLatency = totalLatency.get() / count
             val mbStr = String.format(Locale.getDefault(), "%.1f", bytes / (1024.0 * 1024.0))
 
-            val prefix = if (sessionId.startsWith("audio_") || primaryHost.contains("audio")) "BTR音频优化" else "BTR并发加速"
+            val prefix = when {
+                isEpisode -> "BTR剧集加速"
+                sessionId.startsWith("audio_") || primaryHost.contains("audio") -> "BTR音频优化"
+                else -> "BTR并发加速"
+            }
             val summaryReason = "$prefix · ${count}分片(${mbStr}MB) · ${hitHosts.size}个CDN · 均时${avgLatency}ms"
             val concurrencyLabel = if (burstConcurrency > concurrency) {
                 "冲刺${burstConcurrency}/稳定${concurrency}线程"
@@ -146,6 +168,10 @@ object BtrChunkEngine {
                 btrAvgLatencyMs = avgLatency
             )
             RemoteClient.notifyRewrite(result)
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "stream-complete session=$sessionId chunks=$count bytes=$bytes cdns=${hitHosts.size}"
+            )
         }
     }
 
@@ -264,8 +290,10 @@ object BtrChunkEngine {
             primaryHost = primaryHost,
             concurrency = concurrencyCaps.steady,
             burstConcurrency = concurrencyCaps.burst,
-            proxyPort = proxyPort
+            proxyPort = proxyPort,
+            isEpisode = session.isEpisode
         )
+        val streamCallKey = activeCalls.newStreamCallKey(session.sessionId)
 
         try {
             val hasCachedMetadata = session.totalLength > 0
@@ -290,17 +318,44 @@ object BtrChunkEngine {
                 }
             } else {
                 // 首片探测 (使用 OkHttp 连接池与 HTTP/2 探针)
-                val probeResult = probeMedia(candidateUrls, session, requestedStart, initialProbeChunkSize)
+                val probeResult = probeMedia(candidateUrls, session, requestedStart, initialProbeChunkSize, streamCallKey)
                 if (probeResult == null) {
                     val candidateHosts = candidateUrls.map { extractHostname(it) }.filter { it.isNotBlank() }.distinct()
                     Log.w(TAG, "BTR probe failed; session=${session.sessionId.take(6)} candidates=$candidateHosts")
-                    sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
-                    return
+                    session.nativeDirectFallback = true
+                    io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                        "BTR",
+                        "native-fallback-started session=${session.sessionId.take(6)} reason=probe candidates=${candidateHosts.size}"
+                    )
+                    when (pipeDirectFallback(session, requestedStart, requestedEnd, isHeadOnly, clientOut, streamCallKey)) {
+                        BtrDirectPipeResult.COMPLETED -> {
+                            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                                "BTR",
+                                "native-fallback-succeeded session=${session.sessionId.take(6)} reason=probe"
+                            )
+                            return
+                        }
+                        BtrDirectPipeResult.FAILED_AFTER_RESPONSE -> {
+                            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                                "BTR",
+                                "native-fallback-failed session=${session.sessionId.take(6)} reason=probe responseStarted=true"
+                            )
+                            return
+                        }
+                        BtrDirectPipeResult.FAILED_BEFORE_RESPONSE -> {
+                            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                                "BTR",
+                                "native-fallback-failed session=${session.sessionId.take(6)} reason=probe responseStarted=false"
+                            )
+                            sendHttpError(clientOut, 502, "Bad Gateway - Upstream CDN Unreachable")
+                            return
+                        }
+                    }
                 }
 
                 if (probeResult.isNonRange) {
                     // P0: HTTP 200 非 Range 容错，直接全量流式透传，避免老视频 512KB 截断
-                    pipeNonRangeStream(candidateUrls.firstOrNull() ?: session.primaryUrl, session, clientOut, statsTracker)
+                    pipeNonRangeStream(candidateUrls.firstOrNull() ?: session.primaryUrl, session, clientOut, statsTracker, streamCallKey)
                     return
                 }
 
@@ -428,7 +483,7 @@ object BtrChunkEngine {
                     globalWorkerPool.execute {
                         if (!isClientAborted.get()) {
                             try {
-                                fetchChunkWithFailover(task, candidateUrls, session, statsTracker, isClientAborted)
+                                fetchChunkWithFailover(task, candidateUrls, session, statsTracker, isClientAborted, streamCallKey)
                             } finally {
                                 synchronized(completionLock) {
                                     completionLock.notifyAll()
@@ -458,6 +513,15 @@ object BtrChunkEngine {
                     // P0: 杜绝死等！若分片彻底拉取失败，立即中断交付并触发播放器原生自愈/切集
                     if (currentTask.isFailed || currentTask.data == null) {
                         Log.e(TAG, "Chunk task #$nextDeliverIndex failed (${currentTask.errorMessage}). Aborting stream delivery to trigger player recovery.")
+                        session.nativeDirectFallback = true
+                        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                            "BTR",
+                            "stream-failed session=${session.sessionId.take(6)} reason=chunk task=$nextDeliverIndex"
+                        )
+                        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                            "BTR",
+                            "native-fallback-armed session=${session.sessionId.take(6)} reason=chunk"
+                        )
                         isClientAborted.set(true)
                         break
                     }
@@ -484,11 +548,10 @@ object BtrChunkEngine {
             } finally {
                 isClientAborted.set(true)
                 dispatchFuture.cancel(true)
-                cancelSessionCalls(session.sessionId)
                 taskMap.clear()
             }
         } finally {
-            cancelSessionCalls(session.sessionId)
+            activeCalls.cancelStreamCalls(streamCallKey)
             statsTracker.finishAndReport()
         }
     }
@@ -507,7 +570,8 @@ object BtrChunkEngine {
         url: String,
         session: BtrMediaSession,
         clientOut: OutputStream,
-        statsTracker: StreamStatsTracker
+        statsTracker: StreamStatsTracker,
+        streamCallKey: String
     ) {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
@@ -521,7 +585,7 @@ object BtrChunkEngine {
             .build()
 
         try {
-            executeWithTracking(session.sessionId, okClient.newCall(request)) { response ->
+            executeWithTracking(streamCallKey, session.sessionId, okClient.newCall(request)) { response ->
                 val code = response.code
                 val cl = response.body?.contentLength() ?: -1L
                 val ct = response.header("Content-Type") ?: if (session.isAudio) "audio/mp4" else "video/mp4"
@@ -549,11 +613,124 @@ object BtrChunkEngine {
         } catch (_: Exception) {}
     }
 
+    /**
+     * Strict direct fallback used before BTR has written any response bytes.
+     * It preserves the player's Range and only accepts an official HTTPS URL.
+     * Once a fallback happens, the same session is marked for direct mode so
+     * subsequent retries do not re-enter a failing BTR candidate set.
+     */
+    internal fun pipeDirectFallback(
+        session: BtrMediaSession,
+        requestedStart: Long,
+        requestedEnd: Long?,
+        isHeadOnly: Boolean,
+        clientOut: OutputStream,
+        streamCallKey: String? = null
+    ): BtrDirectPipeResult {
+        if (!BtrHttpSafety.isAllowedUpstreamUrl(session.primaryUrl)) {
+            return BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+        }
+
+        val callKey = streamCallKey ?: activeCalls.newStreamCallKey(session.sessionId)
+        var headersWritten = false
+        return try {
+            val ua = session.userAgent ?: DEFAULT_USER_AGENT
+            val rangeValue = if (requestedEnd != null) {
+                "bytes=$requestedStart-$requestedEnd"
+            } else {
+                "bytes=$requestedStart-"
+            }
+            val request = Request.Builder()
+                .url(session.primaryUrl)
+                .header("Range", rangeValue)
+                .header("Referer", session.referer)
+                .header("User-Agent", ua)
+                .header("Accept-Encoding", "identity")
+                .header("Connection", "close")
+                .build()
+
+            executeWithTracking(callKey, session.sessionId, BtrHttpClient.fallbackClient.newCall(request)) { response ->
+                val code = response.code
+                if (code != 200 && code != 206) {
+                    return@executeWithTracking BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+                }
+
+                val contentRange = response.header("Content-Range")
+                var expectedBodyLength = response.body?.contentLength() ?: -1L
+                if (code == 206) {
+                    val parsedRange = BtrHttpSafety.parseContentRange(contentRange)
+                        ?: return@executeWithTracking BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+                    if (parsedRange.start != requestedStart) {
+                        return@executeWithTracking BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+                    }
+                    if (requestedEnd != null && parsedRange.end > requestedEnd) {
+                        return@executeWithTracking BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+                    }
+                    expectedBodyLength = parsedRange.end - parsedRange.start + 1
+                } else if (requestedStart != 0L || requestedEnd != null) {
+                    // A 200 response to a Range request would send the full file
+                    // and make the local response contract incorrect.
+                    return@executeWithTracking BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+                }
+
+                val contentType = response.header("Content-Type") ?: "application/octet-stream"
+                val reason = response.message.ifBlank {
+                    if (code == 206) "Partial Content" else "OK"
+                }
+                val headerBuilder = StringBuilder()
+                headerBuilder.append("HTTP/1.1 $code $reason\r\n")
+                headerBuilder.append("Content-Type: $contentType\r\n")
+                headerBuilder.append("Accept-Ranges: bytes\r\n")
+                if (contentRange != null) {
+                    headerBuilder.append("Content-Range: $contentRange\r\n")
+                }
+                if (expectedBodyLength >= 0L) {
+                    headerBuilder.append("Content-Length: $expectedBodyLength\r\n")
+                }
+                headerBuilder.append("Connection: close\r\n\r\n")
+                headersWritten = true
+                clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
+                clientOut.flush()
+
+                if (isHeadOnly) {
+                    return@executeWithTracking BtrDirectPipeResult.COMPLETED
+                }
+
+                var totalBytes = 0L
+                response.body?.byteStream()?.use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    var read: Int
+                    while (input.read(buffer).also { read = it } != -1) {
+                        clientOut.write(buffer, 0, read)
+                        totalBytes += read
+                    }
+                }
+                clientOut.flush()
+                if (expectedBodyLength >= 0L && totalBytes != expectedBodyLength) {
+                    BtrDirectPipeResult.FAILED_AFTER_RESPONSE
+                } else {
+                    BtrDirectPipeResult.COMPLETED
+                }
+            }
+        } catch (_: Throwable) {
+            if (headersWritten) {
+                BtrDirectPipeResult.FAILED_AFTER_RESPONSE
+            } else {
+                BtrDirectPipeResult.FAILED_BEFORE_RESPONSE
+            }
+        } finally {
+            if (streamCallKey == null) {
+                activeCalls.cancelStreamCalls(callKey)
+            }
+        }
+    }
+
     private fun probeMedia(
         urls: List<String>,
         session: BtrMediaSession,
         startOffset: Long,
-        chunkSize: Long
+        chunkSize: Long,
+        streamCallKey: String
     ): ProbeResult? {
         val sortedUrls = sortUrlsByHealth(urls)
         val candidateCount = urls.map { extractHostname(it) }.filter { it.isNotBlank() }.distinct().size
@@ -574,7 +751,7 @@ object BtrChunkEngine {
                 .build()
 
             try {
-                executeWithTracking(session.sessionId, okClient.newCall(request)) { response ->
+                executeWithTracking(streamCallKey, session.sessionId, okClient.newCall(request)) { response ->
                     val code = response.code
                     if (code == 200 || code == 206) {
                         val contentRange = response.header("Content-Range")
@@ -652,7 +829,8 @@ object BtrChunkEngine {
         urls: List<String>,
         session: BtrMediaSession,
         statsTracker: StreamStatsTracker,
-        isClientAborted: AtomicBoolean
+        isClientAborted: AtomicBoolean,
+        streamCallKey: String
     ) {
         val sortedUrls = sortUrlsByHealth(urls)
         val candidateCount = urls.map { extractHostname(it) }.filter { it.isNotBlank() }.distinct().size
@@ -682,7 +860,7 @@ object BtrChunkEngine {
 
             val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.client
             try {
-                executeWithTracking(session.sessionId, okClient.newCall(request)) { response ->
+                executeWithTracking(streamCallKey, session.sessionId, okClient.newCall(request)) { response ->
                     val code = response.code
                     if (code == 200 || code == 206) {
                         val bytes = readChunkPayload(response, task.startByte, task.endByte)
@@ -712,12 +890,16 @@ object BtrChunkEngine {
         }
 
         if (!task.isSuccess && urls.isNotEmpty()) {
-            tryDirectFetch(task, urls.first(), session, statsTracker)
+            tryDirectFetch(task, urls.first(), session, statsTracker, streamCallKey)
         }
 
         if (!task.isSuccess) {
             task.isFailed = true
             task.errorMessage = "All candidate CDNs failed for range ${task.startByte}-${task.endByte}"
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "chunk-failed session=${session.sessionId.take(6)} range=${task.startByte}-${task.endByte} candidates=$candidateCount"
+            )
         }
     }
 
@@ -725,7 +907,8 @@ object BtrChunkEngine {
         task: ChunkTask,
         url: String,
         session: BtrMediaSession,
-        statsTracker: StreamStatsTracker
+        statsTracker: StreamStatsTracker,
+        streamCallKey: String
     ) {
         if (!BtrHttpSafety.isAllowedUpstreamUrl(url)) return
         val host = extractHostname(url)
@@ -741,7 +924,7 @@ object BtrChunkEngine {
 
         val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.fallbackClient
         try {
-            executeWithTracking(session.sessionId, okClient.newCall(request)) { response ->
+            executeWithTracking(streamCallKey, session.sessionId, okClient.newCall(request)) { response ->
                 val bytes = readChunkPayload(response, task.startByte, task.endByte) ?: return@executeWithTracking
                 task.data = bytes
                 task.isSuccess = true
@@ -865,7 +1048,7 @@ object BtrChunkEngine {
             originalUrl = "",
             finalUrl = "",
             originalHost = badHost,
-            targetHost = "备用镜像/CDN",
+            targetHost = "单节点退避/继续尝试",
             reason = "BTR节点熔断: $reason",
             isPcdn = false,
             isMcdn = false,
@@ -874,6 +1057,10 @@ object BtrChunkEngine {
             btrCdnCount = candidateCount.coerceIn(0, 64)
         )
         RemoteClient.notifyRewrite(result)
+        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+            "BTR",
+            "node-backoff session=${sessionId.take(6)} host=$badHost candidates=$candidateCount reason=$reason"
+        )
     }
 
     private fun sendHttpError(out: OutputStream, code: Int, message: String) {

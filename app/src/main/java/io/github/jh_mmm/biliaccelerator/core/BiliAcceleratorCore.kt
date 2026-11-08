@@ -42,6 +42,7 @@ data class AcceleratorConfig(
     val btrChunkSizeKb: Int = 512,
     val customCdnPool: List<String> = emptyList(),
     val btrCdnPoolSize: Int = 8,
+    val enableEpisodeAcceleration: Boolean = true,
     val enableDebugLogging: Boolean = false
 )
 
@@ -151,7 +152,7 @@ object BiliAcceleratorCore {
     fun getEffectiveCdnPool(config: AcceleratorConfig): List<String> {
         val userList = config.customCdnPool
             .map { cleanHost(it).lowercase() }
-            .filter { isOfficialBiliHost(it) && !isAkamaiHost(it) }
+            .filter { isBiliCdnHost(it) && !isAkamaiHost(it) }
             .distinct()
         val basePool = if (userList.isNotEmpty()) userList else {
             if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL else MAINLAND_CANDIDATE_POOL
@@ -494,6 +495,40 @@ object BiliAcceleratorCore {
                 lowerUrl.contains("live.bilibili.com") ||
                 lowerUrl.contains("live-play") ||
                 lowerUrl.contains("live_id=")
+    }
+
+    /**
+     * Recognizes Bilibili PGC/OGV episode media URLs without treating ordinary
+     * UGC playback IDs as episodes.
+     */
+    fun isEpisodeMediaUrl(url: String, path: String = ""): Boolean {
+        if (url.isBlank() && path.isBlank()) return false
+        val lowerUrl = url.lowercase()
+        val lowerPath = (path.ifBlank { parseUri(url)?.path ?: "" }).lowercase()
+        return lowerPath.contains("/bangumi/") ||
+                lowerPath.contains("/ogv/") ||
+                lowerPath.contains("/pgc/") ||
+                lowerUrl.contains("ep_id=") ||
+                lowerUrl.contains("epid=") ||
+                lowerUrl.contains("season_id=") ||
+                lowerUrl.contains("season_type=") ||
+                lowerUrl.contains("scene=ogv") ||
+                lowerUrl.contains("scene=pgc") ||
+                lowerUrl.contains("business=pgc") ||
+                lowerUrl.contains("biz=pgc") ||
+                lowerUrl.contains("is_pgc=1")
+    }
+
+    /**
+     * Preview/trial streams can depend on player-side entitlement handling and
+     * must stay on the native player path rather than entering BTR.
+     */
+    fun isEpisodePreview(url: String): Boolean {
+        if (url.isBlank()) return false
+        val lower = url.lowercase()
+        return lower.contains("is_preview=1") ||
+                lower.contains("preview=1") ||
+                lower.contains("trial=1")
     }
 
     private val AUDIO_REP_REGEX = Regex("""-(302\d{2}|3025\d)\.(m4s|mp4)""", RegexOption.IGNORE_CASE)

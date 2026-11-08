@@ -162,6 +162,7 @@ object DebugReportBuilder {
         sb.appendLine("btrAutoChunkSize=${config.btrAutoChunkSize}")
         sb.appendLine("btrChunkSizeKb=${config.btrChunkSizeKb}")
         sb.appendLine("btrCdnPoolSize=${config.btrCdnPoolSize}")
+        sb.appendLine("enableEpisodeAcceleration=${config.enableEpisodeAcceleration}")
         sb.appendLine("enableDebugLogging=${config.enableDebugLogging}")
         sb.appendLine("customCdnPool=${if (config.customCdnPool.isEmpty()) "<empty>" else config.customCdnPool.joinToString(", ")}")
         sb.appendLine("直播策略: 完全直通，不执行 PCDN Host 替换，不进入 BTR")

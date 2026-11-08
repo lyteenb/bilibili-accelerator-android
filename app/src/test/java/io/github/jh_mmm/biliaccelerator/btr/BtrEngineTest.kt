@@ -4,6 +4,11 @@ import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Request
+import okhttp3.Response
+import okio.Timeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -437,5 +442,132 @@ class BtrEngineTest {
             val hasCustomHost = customPool.any { backup.contains(it) }
             assertTrue("Synthesized backup must belong to custom pool", hasCustomHost)
         }
+    }
+
+    @Test
+    fun testDirectUposRequiresTwoTrustedCandidatesBeforeEnteringBtr() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        val onlySameHost = AcceleratorConfig(
+            customCdnPool = listOf("upos-sz-mirrorali.bilivideo.com"),
+            btrCdnPoolSize = 8
+        )
+        val plan = BtrSessionManager.buildCandidatePlan(primary, config = onlySameHost)
+        assertTrue("Direct UPOS should be recognized", plan.isDirectUpos)
+        assertFalse("A single host must not enter multi-source BTR", plan.hasMultiSource)
+        assertFalse(BtrSessionManager.shouldUseBtr(primary, config = onlySameHost))
+    }
+
+    @Test
+    fun testDirectUposWithDefaultRegionalPoolCanUseBtr() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        val config = AcceleratorConfig(btrCdnPoolSize = 8)
+        val plan = BtrSessionManager.buildCandidatePlan(primary, config = config)
+        assertTrue(plan.hasMultiSource)
+        assertTrue(plan.candidateHosts.all { !it.contains("ov.bilivideo.com") })
+        assertTrue(BtrSessionManager.shouldUseBtr(primary, config = config))
+    }
+
+    @Test
+    fun testCrossRegionExplicitBackupIsRejected() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        val backup = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        val plan = BtrSessionManager.buildCandidatePlan(primary, listOf(backup))
+        assertTrue("Cross-region backup must be removed", plan.backupUrls.none { it.contains("ov.bilivideo.com") })
+        assertTrue("Safe mainland fallback candidates should be synthesized", plan.hasMultiSource)
+    }
+
+    @Test
+    fun testEpisodeRegionalStreamUsesOverseasMirrorsAndBangumiReferer() {
+        val primary = "https://cn-hk-eq-01-01.bilivideo.com/upgcxcode/54/12/12345.m4s?ep_id=12345"
+        val plan = BtrSessionManager.buildCandidatePlan(primary, isEpisode = true)
+        assertTrue(plan.hasMultiSource)
+        assertTrue(plan.backupUrls.all { it.contains("ov.bilivideo.com") || it.contains("cn-hk-eq") })
+
+        val sessionId = BtrSessionManager.register(primary, isEpisode = true)
+        val session = BtrSessionManager.get(sessionId)
+        assertTrue(session?.isEpisode == true)
+        assertEquals("https://www.bilibili.com/bangumi/play/", session?.referer)
+    }
+
+    @Test
+    fun testEpisodeDetectionDoesNotMatchOrdinaryUgc() {
+        val episode = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s?ep_id=12345"
+        val ugc = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s?deadline=1700000000"
+        assertTrue(BiliAcceleratorCore.isEpisodeMediaUrl(episode))
+        assertFalse(BiliAcceleratorCore.isEpisodeMediaUrl(ugc))
+        assertTrue(BiliAcceleratorCore.isEpisodePreview("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s?is_preview=1"))
+        assertFalse(BiliAcceleratorCore.isEpisodePreview("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s?is_preview=0"))
+    }
+
+    @Test
+    fun testCancellingOldStreamDoesNotCancelNewStreamOnSameSession() {
+        BtrLocalProxyServer.stop()
+        val oldCall = FakeCall()
+        val newCall = FakeCall()
+        val sessionId = "same-session"
+        val oldKey = BtrChunkEngine.registerActiveCallForTesting(sessionId, oldCall)
+        val newKey = BtrChunkEngine.registerActiveCallForTesting(sessionId, newCall)
+
+        assertTrue(BtrChunkEngine.hasSessionStreamKeyForTesting(sessionId))
+        BtrChunkEngine.cancelStreamCallsForTesting(oldKey)
+
+        assertTrue("Old stream should be cancelled", oldCall.isCanceled())
+        assertFalse("New stream must survive seek/old-connection cleanup", newCall.isCanceled())
+        assertEquals(1, BtrChunkEngine.activeStreamCallCountForTesting())
+        BtrChunkEngine.cancelStreamCallsForTesting(newKey)
+    }
+
+    @Test
+    fun testLocalProxyStopCancelsEveryActiveStreamAndClearsKeys() {
+        BtrLocalProxyServer.stop()
+        val callA = FakeCall()
+        val callB = FakeCall()
+        BtrChunkEngine.registerActiveCallForTesting("session-a", callA)
+        BtrChunkEngine.registerActiveCallForTesting("session-b", callB)
+
+        BtrLocalProxyServer.stop()
+
+        assertTrue(callA.isCanceled())
+        assertTrue(callB.isCanceled())
+        assertEquals(0, BtrChunkEngine.activeStreamCallCountForTesting())
+    }
+
+    @Test
+    fun testUnregisterRemovesEmptyStreamKey() {
+        BtrLocalProxyServer.stop()
+        val call = FakeCall()
+        val key = BtrChunkEngine.registerActiveCallForTesting("session-cleanup", call)
+        BtrChunkEngine.unregisterActiveCallForTesting(key, call)
+
+        assertFalse(BtrChunkEngine.hasSessionStreamKeyForTesting("session-cleanup"))
+        assertEquals(0, BtrChunkEngine.activeStreamCallCountForTesting())
+    }
+
+    @Test
+    fun testNativeDirectFallbackIsSessionScoped() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
+        val sessionId = BtrSessionManager.register(primary)
+        val session = BtrSessionManager.get(sessionId)
+        assertFalse(session?.nativeDirectFallback ?: true)
+
+        session?.nativeDirectFallback = true
+        assertTrue("Native fallback flag must persist for the same session", BtrSessionManager.get(sessionId)?.nativeDirectFallback == true)
+    }
+
+    private class FakeCall : Call {
+        private val request = Request.Builder()
+            .url("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s")
+            .build()
+        @Volatile
+        private var canceled = false
+
+        override fun request(): Request = request
+        override fun execute(): Response = throw UnsupportedOperationException("Not used by registry tests")
+        override fun enqueue(responseCallback: Callback) = throw UnsupportedOperationException("Not used by registry tests")
+        override fun cancel() { canceled = true }
+        override fun isCanceled(): Boolean = canceled
+        override fun isExecuted(): Boolean = false
+        override fun timeout(): Timeout = Timeout.NONE
+        override fun clone(): Call = FakeCall()
     }
 }

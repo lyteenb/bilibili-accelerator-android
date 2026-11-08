@@ -91,11 +91,12 @@ jobs:
 
       - name: Build Release APK
         run: |
-          ./gradlew assembleRelease --stacktrace > release.log 2>&1 || true
-          cat release.log | tail -n 50
-          if grep -q "BUILD FAILED" release.log; then
+          ./gradlew assembleRelease --stacktrace 2>&1 | tee release.log
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ] || grep -q "BUILD FAILED" release.log; then
             ERR=$(grep -E "(e: |error:|FAILURE:|FAILED|Exception:)" release.log | head -n 30 | tr '\n' ' ' | tr '\r' ' ')
-            echo "::error::Release build failed: $ERR"
+            echo "::error::Release build failed (exit $STATUS): $ERR"
+            tail -n 100 release.log
             exit 1
           fi
         env:
@@ -120,9 +121,12 @@ jobs:
           if [ -z "$APK_FILE" ]; then
             APK_FILE=$(find app/build/outputs -name "*.apk" 2>/dev/null | head -n 1)
           fi
+          echo "### Outputs Listing" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find app/build/outputs -type f >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
           if [ -z "$APK_FILE" ]; then
-            echo "::error::No APK found! Outputs directory listing:"
-            find app/build/outputs -type f || true
+            echo "::error::No APK found in app/build/outputs!"
             exit 1
           fi
           cp "$APK_FILE" "outputs/${NAME}"

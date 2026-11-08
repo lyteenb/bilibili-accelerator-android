@@ -241,8 +241,38 @@ object PlayerHook {
             Log.i(TAG, "DRM protected stream detected, bypassing BTR proxy")
             return null
         }
+        val isEpisode = BiliAcceleratorCore.isEpisodeMediaUrl(originalUrl) ||
+                (result.changed && BiliAcceleratorCore.isEpisodeMediaUrl(result.finalUrl))
+        if (isEpisode) {
+            if (!config.enableEpisodeAcceleration) {
+                Log.i(TAG, "Episode acceleration disabled, leaving episode stream to native player")
+                return null
+            }
+            if (BiliAcceleratorCore.isEpisodePreview(originalUrl) ||
+                (result.changed && BiliAcceleratorCore.isEpisodePreview(result.finalUrl))
+            ) {
+                Log.i(TAG, "Episode preview detected, leaving stream to native player")
+                return null
+            }
+        }
+
         val targetUrl = if (result.changed) result.finalUrl else originalUrl
         if (!io.github.jh_mmm.biliaccelerator.btr.BtrHttpSafety.isAllowedUpstreamUrl(targetUrl)) {
+            return null
+        }
+
+        // A direct UPOS stream is not worth a local loopback hop unless we can
+        // build at least two trusted, same-region candidates. MCDN/relay
+        // streams keep their existing priority because their outer relay host
+        // can be swapped without changing the nested signed URL.
+        val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
+        if (!io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.shouldUseBtr(
+                targetUrl,
+                pendingBackups,
+                config,
+                isEpisode
+            )
+        ) {
             return null
         }
 
@@ -261,13 +291,13 @@ object PlayerHook {
             return null
         }
 
-        val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
         val isAudio = BiliAcceleratorCore.isAudioTrack(targetUrl)
 
         val sessionId = io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.register(
             primaryUrl = targetUrl,
             backupUrls = pendingBackups,
             isAudio = isAudio,
+            isEpisode = isEpisode,
             config = config
         )
         if (builderInstance != null) {

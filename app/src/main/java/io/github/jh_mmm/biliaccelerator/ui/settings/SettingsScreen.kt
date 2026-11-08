@@ -111,6 +111,7 @@ fun SettingsScreen(
     var showUposDialog by rememberSaveable { mutableStateOf(false) }
     var showSpeedTestDialog by rememberSaveable { mutableStateOf(false) }
     var showProxyHostDialog by rememberSaveable { mutableStateOf(false) }
+    var showCustomCdnDialog by rememberSaveable { mutableStateOf(false) }
     var showMcdnStrategyDialog by rememberSaveable { mutableStateOf(false) }
     var showStyleDialog by rememberSaveable { mutableStateOf(false) }
     var showThemeModeDialog by rememberSaveable { mutableStateOf(false) }
@@ -158,6 +159,18 @@ fun SettingsScreen(
                 showProxyHostDialog = false
             },
             onDismiss = { showProxyHostDialog = false }
+        )
+    }
+
+    // Dialog 1.5b: Custom CDN pool
+    if (showCustomCdnDialog) {
+        CustomCdnPoolDialog(
+            customPool = config.customCdnPool,
+            onSave = { newPool ->
+                onConfigChange(config.copy(customCdnPool = newPool))
+                showCustomCdnDialog = false
+            },
+            onDismiss = { showCustomCdnDialog = false }
         )
     }
 
@@ -349,7 +362,8 @@ fun SettingsScreen(
                                 val btrSummary = if (!config.enableBtr) {
                                     "已停用多线程切片加速 (点击进入高级配置)"
                                 } else {
-                                    "已启用 · $btrThreadDesc · $btrChunkDesc · ${config.btrCdnPoolSize} 节点"
+                                    val episodeTag = if (config.enableEpisodeAcceleration) " · 剧集" else ""
+                                    "已启用 · $btrThreadDesc · $btrChunkDesc · ${config.btrCdnPoolSize} 节点$episodeTag"
                                 }
 
                                 PreferenceDropdownItem(
@@ -661,6 +675,20 @@ fun SettingsScreen(
 
                                 PreferenceDivider()
 
+                                PreferenceActionItem(
+                                    title = "自定义 CDN 节点池",
+                                    summary = if (config.customCdnPool.isEmpty()) {
+                                        "未自定义，使用系统默认同区域 UPOS 节点池"
+                                    } else {
+                                        "已配置 ${config.customCdnPool.size} 个官方 CDN 节点"
+                                    },
+                                    onClick = {
+                                        if (config.enabled && config.enableBtr) showCustomCdnDialog = true
+                                    }
+                                )
+
+                                PreferenceDivider()
+
                                 PreferenceSwitchItem(
                                     title = "BTR 自适应切片尺寸",
                                     summary = "根据视频体积与清晰度在 256KB~2MB 动态匹配切片大小，兼顾秒开与高码率吞吐",
@@ -703,6 +731,22 @@ fun SettingsScreen(
                                     showKeyPoints = true,
                                     keyPoints = listOf(0f, 1f, 2f, 3f),
                                     valueLabel = "${config.btrChunkSizeKb} KB",
+                                    enabled = config.enabled && config.enableBtr
+                                )
+                            }
+                        }
+
+                        item(key = "header-btr-episode") {
+                            PreferenceGroupTitle("专项场景加速")
+                        }
+
+                        item(key = "card-btr-episode") {
+                            PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = "剧集加速专属模式",
+                                    summary = "番剧、电影、纪录片等 PGC 内容启用同区域多源调度；试看流与 DRM 流保持原生直通",
+                                    checked = config.enableEpisodeAcceleration,
+                                    onCheckedChange = { onConfigChange(config.copy(enableEpisodeAcceleration = it)) },
                                     enabled = config.enabled && config.enableBtr
                                 )
                             }
@@ -759,6 +803,79 @@ private fun SingleChoiceDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) {
                 Text("关闭")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
+@Composable
+private fun CustomCdnPoolDialog(
+    customPool: List<String>,
+    onSave: (List<String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var textValue by rememberSaveable {
+        mutableStateOf(customPool.joinToString("\n"))
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("自定义 CDN 节点池") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "每行填写一个官方 B 站 UPOS/CDN 域名。仅保留 *.bilivideo.com/.cn/.net；Akamai、裸 IP、HTTP 和非官方域名会被拒绝。留空则恢复默认同区域节点池。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                OutlinedTextField(
+                    value = textValue,
+                    onValueChange = { textValue = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp),
+                    placeholder = {
+                        Text(
+                            "例:\nupos-sz-mirrorcos.bilivideo.com\nupos-sz-mirrorali.bilivideo.com",
+                            fontSize = 12.sp
+                        )
+                    }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val hosts = textValue.lines()
+                    .map { BiliAcceleratorCore.cleanHost(it).substringBefore(':').trim().lowercase() }
+                    .filter {
+                        it.isNotBlank() &&
+                            BiliAcceleratorCore.isValidHost(it) &&
+                            BiliAcceleratorCore.isBiliCdnHost(it) &&
+                            !BiliAcceleratorCore.isAkamaiHost(it)
+                    }
+                    .distinct()
+                    .take(32)
+                onSave(hosts)
+            }) {
+                Text("保存")
+            }
+        },
+        dismissButton = {
+            Row {
+                if (customPool.isNotEmpty()) {
+                    TextButton(onClick = { onSave(emptyList()) }) {
+                        Text("恢复默认")
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("取消")
+                }
             }
         },
         shape = RoundedCornerShape(20.dp)
@@ -933,7 +1050,7 @@ private fun UposSpeedTestDialog(
         try {
             conn.connect()
             val code = conn.responseCode
-            if (code !in 200..499) {
+            if (code !in 200..399) {
                 throw IllegalStateException("HTTP $code")
             }
             return (System.currentTimeMillis() - t0).coerceAtLeast(1L)

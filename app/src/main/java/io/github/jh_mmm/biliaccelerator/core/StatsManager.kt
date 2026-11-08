@@ -617,6 +617,11 @@ object StatsManager {
         sb.appendLine("PCDN 拦截: ${if (config.blockPcdn) "已开启" else "已关闭"}")
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")
+        sb.appendLine("BTR 并发加速: ${if (config.enableBtr) "开启 (${config.btrConcurrency}线程, 节点池 ${config.btrCdnPoolSize})" else "关闭"}")
+        sb.appendLine("剧集加速: ${if (config.enableEpisodeAcceleration) "开启" else "关闭"}")
+        if (config.customCdnPool.isNotEmpty()) {
+            sb.appendLine("自定义 CDN 节点池: ${config.customCdnPool.size} 个节点")
+        }
         sb.appendLine("Moss gRPC 注入: ${if (config.enableMossHook) "开启 (实验性)" else "关闭 (默认)"}")
         sb.appendLine("Debug 日志: ${if (config.enableDebugLogging) "开启" else "关闭"}")
         sb.appendLine("-----------------------------------------")

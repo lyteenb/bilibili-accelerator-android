@@ -188,6 +188,41 @@ object BtrLocalProxyServer {
                     return
                 }
 
+                if (session.nativeDirectFallback) {
+                    io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                        "BTR",
+                        "native-direct-request session=${session.sessionId.take(6)} range=${range.first}-${range.second ?: "open"}"
+                    )
+                    when (BtrChunkEngine.pipeDirectFallback(
+                        session = session,
+                        requestedStart = range.first,
+                        requestedEnd = range.second,
+                        isHeadOnly = request.method == "HEAD",
+                        clientOut = output
+                    )) {
+                        BtrDirectPipeResult.COMPLETED -> {
+                            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                                "BTR",
+                                "native-direct-succeeded session=${session.sessionId.take(6)}"
+                            )
+                        }
+                        BtrDirectPipeResult.FAILED_BEFORE_RESPONSE -> {
+                            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                                "BTR",
+                                "native-direct-failed session=${session.sessionId.take(6)} responseStarted=false"
+                            )
+                            sendError(output, 502, "Bad Gateway - Native Fallback Failed")
+                        }
+                        BtrDirectPipeResult.FAILED_AFTER_RESPONSE -> {
+                            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                                "BTR",
+                                "native-direct-failed session=${session.sessionId.take(6)} responseStarted=true"
+                            )
+                        }
+                    }
+                    return
+                }
+
                 BtrChunkEngine.pipeStream(
                     session = session,
                     requestedStart = range.first,
