@@ -24,6 +24,21 @@ class XposedServiceProvider : ContentProvider() {
 
     companion object {
         private const val TAG = "BiliAccelerator-XSP"
+        private fun safeWarn(message: String, throwable: Throwable? = null) {
+            try {
+                if (throwable == null) Log.w(TAG, message) else Log.w(TAG, message, throwable)
+            } catch (_: Throwable) {}
+        }
+        private fun safeInfo(message: String) {
+            try {
+                Log.i(TAG, message)
+            } catch (_: Throwable) {}
+        }
+        private fun safeError(message: String, throwable: Throwable? = null) {
+            try {
+                if (throwable == null) Log.e(TAG, message) else Log.e(TAG, message, throwable)
+            } catch (_: Throwable) {}
+        }
         const val METHOD_SEND_BINDER = "SendBinder"
         const val EXTRA_BINDER = "binder"
 
@@ -94,7 +109,7 @@ class XposedServiceProvider : ContentProvider() {
         fun verifyLibXposedBinder(binder: IBinder): Boolean {
             val isAlive = runCatching { binder.isBinderAlive && binder.pingBinder() }.getOrDefault(false)
             if (!isAlive) {
-                Log.w(TAG, "verifyLibXposedBinder: Binder is not alive or ping failed")
+                safeWarn("verifyLibXposedBinder: Binder is not alive or ping failed")
                 return false
             }
 
@@ -110,7 +125,7 @@ class XposedServiceProvider : ContentProvider() {
                 return true
             }
 
-            Log.w(TAG, "verifyLibXposedBinder rejected: descriptor='$descriptor', frameworkName='$frameworkName'")
+            safeWarn("verifyLibXposedBinder rejected: descriptor='$descriptor', frameworkName='$frameworkName'")
             return false
         }
 
@@ -133,7 +148,7 @@ class XposedServiceProvider : ContentProvider() {
                     null
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "transact INTERFACE_TRANSACTION failed: ${t.message}")
+                safeWarn("transact INTERFACE_TRANSACTION failed: ${t.message}")
                 null
             } finally {
                 runCatching { reply.recycle() }
@@ -157,7 +172,7 @@ class XposedServiceProvider : ContentProvider() {
                     null
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "transact TRANSACTION_GET_FRAMEWORK_NAME failed: ${t.message}")
+                safeWarn("transact TRANSACTION_GET_FRAMEWORK_NAME failed: ${t.message}")
                 null
             } finally {
                 runCatching { reply.recycle() }
@@ -181,7 +196,7 @@ class XposedServiceProvider : ContentProvider() {
                     null
                 }
             } catch (t: Throwable) {
-                Log.w(TAG, "transact TRANSACTION_GET_SCOPE failed: ${t.message}")
+                safeWarn("transact TRANSACTION_GET_SCOPE failed: ${t.message}")
                 null
             } finally {
                 runCatching { reply.recycle() }
@@ -203,18 +218,18 @@ class XposedServiceProvider : ContentProvider() {
                 try {
                     val scope = queryFrameworkScope(targetBinder)
                     if (scope != null) {
-                        Log.i(TAG, "Queried framework scope: $scope")
+                        safeInfo("Queried framework scope: $scope")
                         io.github.jh_mmm.biliaccelerator.core.StatsManager.recordFrameworkScope(scope)
                     }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "Async scope query exception: ${t.message}")
+                    safeWarn("Async scope query exception: ${t.message}")
                 }
             }
         }
 
         private fun handleBinderDied(deadBinder: IBinder?) {
             synchronized(lock) {
-                if (deadBinder == null || serviceBinder == deadBinder) {
+                if (deadBinder == null || serviceBinder === deadBinder) {
                     rawIsBound = false
                     serviceBinder = null
                     deathRecipient = null
@@ -269,40 +284,40 @@ class XposedServiceProvider : ContentProvider() {
         val uid = Binder.getCallingUid()
 
         if (!METHOD_SEND_BINDER.equals(method, ignoreCase = true)) {
-            Log.w(TAG, "Rejected invalid method: $method (uid=$uid)")
+            safeWarn("Rejected invalid method: $method (uid=$uid)")
             return null
         }
 
         if (extras == null) {
-            Log.w(TAG, "Missing extras in call(method=$method)")
+            safeWarn("Missing extras in call(method=$method)")
             return null
         }
 
         val binder = extras.getBinder(EXTRA_BINDER)
         if (binder == null) {
-            Log.w(TAG, "No binder provided in extras (method=$method)")
+            safeWarn("No binder provided in extras (method=$method)")
             return null
         }
 
         if (!isCallerAuthorized(context, uid)) {
-            Log.w(TAG, "Rejected unauthorized call from uid=$uid (method=$method)")
+            safeWarn("Rejected unauthorized call from uid=$uid (method=$method)")
             return null
         }
 
         if (!verifyLibXposedBinder(binder)) {
-            Log.w(TAG, "Rejected binder with invalid identity/descriptor from uid=$uid (method=$method)")
+            safeWarn("Rejected binder with invalid identity/descriptor from uid=$uid (method=$method)")
             return null
         }
 
         synchronized(lock) {
             val current = serviceBinder
             if (current != null && current.isBinderAlive && current.pingBinder()) {
-                if (current == binder) {
+                if (current === binder) {
                     triggerScopeQueryAsync(binder, force = false)
                     return Bundle().apply { putBoolean("result", true) }
                 }
                 // 已有存活的框架 Binder 绑定时拒绝被其他调用顶替，防止状态假阳性劫持
-                Log.w(TAG, "Ignored binder replacement while existing XposedService binder is alive (uid=$uid)")
+                safeWarn("Ignored binder replacement while existing XposedService binder is alive (uid=$uid)")
                 return null
             }
 
@@ -313,7 +328,7 @@ class XposedServiceProvider : ContentProvider() {
             }
 
             val recipient = IBinder.DeathRecipient {
-                Log.w(TAG, "Framework XposedService Binder died")
+                safeWarn("Framework XposedService Binder died")
                 handleBinderDied(binder)
             }
 
@@ -322,9 +337,9 @@ class XposedServiceProvider : ContentProvider() {
                 serviceBinder = binder
                 deathRecipient = recipient
                 rawIsBound = true
-                Log.i(TAG, "Successfully bound framework XposedService Binder from uid=$uid")
+                safeInfo("Successfully bound framework XposedService Binder from uid=$uid")
             } catch (t: Throwable) {
-                Log.w(TAG, "Failed to linkToDeath on binder: ${t.message}")
+                safeWarn("Failed to linkToDeath on binder: ${t.message}")
                 rawIsBound = false
                 serviceBinder = null
                 deathRecipient = null

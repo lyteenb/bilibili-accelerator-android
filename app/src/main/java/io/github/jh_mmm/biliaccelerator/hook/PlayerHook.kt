@@ -182,7 +182,7 @@ object PlayerHook {
         config: AcceleratorConfig,
         builderInstance: Any? = null
     ): String? {
-        if (!config.enabled || !config.enableBtr || !io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+        if (!config.enabled || !config.enableBtr) {
             return null
         }
         // 直播流（FLV/HLS/Live）绝对不重写至 BTR 本地代理
@@ -195,6 +195,25 @@ object PlayerHook {
             return null
         }
         val targetUrl = if (result.changed) result.finalUrl else originalUrl
+        if (!io.github.jh_mmm.biliaccelerator.btr.BtrHttpSafety.isAllowedUpstreamUrl(targetUrl)) {
+            return null
+        }
+
+        // The proxy may not have been started during PackageLoaded because the
+        // configuration provider was not reachable yet. Start it lazily once a
+        // resolved, enabled configuration reaches the player path.
+        if (!io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+            io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
+                concurrency = config.btrConcurrency,
+                chunkSizeKb = config.btrChunkSizeKb,
+                autoConcurrency = config.btrAutoConcurrency,
+                autoChunkSize = config.btrAutoChunkSize
+            )
+        }
+        if (!io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+            return null
+        }
+
         val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty()
         val isAudio = BiliAcceleratorCore.isAudioTrack(targetUrl)
 
@@ -230,7 +249,7 @@ object PlayerHook {
                 newArgs[strIndex] = result.finalUrl
                 return newArgs
             }
-            if (result.isPcdn && config.blockPcdn && parsed != null) {
+            if (result.isPcdn && config.blockPcdn) {
                 val cleanLiveHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
                 if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isKnownP2pHost(cleanLiveHost) && !BiliAcceleratorCore.isIpAddress(cleanLiveHost)) {
                     val rewritten = parsed.replaceAuthority(cleanLiveHost)

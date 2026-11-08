@@ -9,6 +9,7 @@ import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.IpcSecurity
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto
@@ -49,6 +50,9 @@ class StatsReceiver : BroadcastReceiver() {
         )
 
         internal fun isPayloadLegitimate(batchJson: String?, singleJson: String?): Boolean {
+            if (!IpcSecurity.isJsonSizeAllowed(batchJson) || !IpcSecurity.isJsonSizeAllowed(singleJson)) {
+                return false
+            }
             if (!batchJson.isNullOrEmpty()) {
                 return try {
                     val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
@@ -96,80 +100,74 @@ class StatsReceiver : BroadcastReceiver() {
         val action = intent.action
         if (action != ACTION_RECORD_REWRITE && action != ACTION_HANDSHAKE) return
 
-        // 1. 严格鉴权：优先校验由 AMS 担保的 PendingIntent 来源包名；
-        // 若在 Android 14+ / 沙箱多用户分身环境导致 creatorPackage 为 null，且广播定向给本包名，则进入 Payload 结构兜底鉴权
+        // AMS 会为 PendingIntent 填充 creatorUid/creatorPackage。Uid is the
+        // primary identity; creatorPackage can be null in clones/work profiles.
         val authToken: PendingIntent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             runCatching { intent.getParcelableExtra(EXTRA_AUTH_TOKEN, PendingIntent::class.java) }.getOrNull()
         } else {
             @Suppress("DEPRECATION")
             runCatching { intent.getParcelableExtra<PendingIntent>(EXTRA_AUTH_TOKEN) }.getOrNull()
         }
+        val creatorUid = runCatching { authToken?.creatorUid }.getOrNull()
+        val creatorPackage = runCatching { authToken?.creatorPackage }.getOrNull()
+        val trustedCreator = if (
+            creatorPackage != null && IpcSecurity.isTrustedPackage(context, creatorPackage)
+        ) {
+            creatorPackage
+        } else {
+            creatorUid?.let { IpcSecurity.resolveTrustedPackage(context, it) }
+        }
+        if (!IpcSecurity.isDirectedToPackage(intent, context) || trustedCreator == null) {
+            Log.w(TAG, "拒绝未鉴权广播：creatorPackage=$creatorPackage, creatorUid=$creatorUid")
+            return
+        }
 
-        val creatorPackage = authToken?.creatorPackage
-        val hasValidCreator = creatorPackage != null && (
-                BiliAcceleratorCore.isTargetPackage(creatorPackage) ||
-                        creatorPackage == context.packageName
-                )
-
-        // 2. 确保 StatsManager 状态先从 SharedPreferences 载入
         StatsManager.ensureInitialized(context)
 
         // 3. 处理独立握手广播 (ACTION_HANDSHAKE)
         if (action == ACTION_HANDSHAKE) {
-            val clientPkg = intent.getStringExtra(EXTRA_CLIENT_PACKAGE)?.trim()
-            val isAuthorized = hasValidCreator || (
-                    !clientPkg.isNullOrBlank() &&
-                            BiliAcceleratorCore.isTargetPackage(clientPkg) &&
-                            isDirectedToModule(intent, context)
-                    )
-
-            if (!isAuthorized) {
-                Log.w(TAG, "拒绝未鉴权或伪造的握手广播：creatorPackage=$creatorPackage, clientPkg=$clientPkg")
-                return
-            }
-
-            val finalPkg = if (hasValidCreator) creatorPackage else clientPkg
-            val clientVer = intent.getStringExtra(EXTRA_CLIENT_VERSION)?.trim()?.take(64)
-            val clientProc = intent.getStringExtra(EXTRA_CLIENT_PROCESS)?.trim()?.take(128)
+            val clientVer = IpcSecurity.sanitizeSingleLine(intent.getStringExtra(EXTRA_CLIENT_VERSION), 64)
+            val clientProc = IpcSecurity.sanitizeSingleLine(intent.getStringExtra(EXTRA_CLIENT_PROCESS), 128)
 
             StatsManager.recordHandshake(
-                pkg = finalPkg,
+                pkg = trustedCreator,
                 version = clientVer,
                 process = clientProc,
                 context = context
             )
 
             intent.getStringExtra(EXTRA_HOOK_STATUS_JSON)?.let { hookJson ->
+                if (!IpcSecurity.isJsonSizeAllowed(hookJson, IpcSecurity.MAX_HOOK_JSON_CHARS)) {
+                    Log.w(TAG, "忽略超限 Hook 状态 JSON")
+                    return@let
+                }
                 try {
                     val mapType = object : TypeToken<Map<String, String?>>() {}.type
                     val rawHookMap: Map<String, String?> = gson.fromJson(hookJson, mapType)
                     val sanitizedMap = rawHookMap.entries
                         .take(50)
                         .filter { it.key.isNotBlank() && it.value != null }
-                        .associate { it.key.trim().take(64) to it.value!!.trim().take(256) }
+                        .associate { entry ->
+                            (IpcSecurity.sanitizeSingleLine(entry.key, 64) ?: "") to
+                                (IpcSecurity.sanitizeSingleLine(entry.value, 256) ?: "")
+                        }
+                        .filterKeys { it.isNotEmpty() }
                     StatsManager.recordHookStatus(sanitizedMap, context)
                 } catch (_: Exception) {}
             }
-            Log.i(TAG, "通过 Broadcast 成功记录宿主握手心跳: pkg=$finalPkg ver=$clientVer proc=$clientProc")
+            Log.i(TAG, "通过 Broadcast 成功记录宿主握手心跳: pkg=$trustedCreator ver=$clientVer proc=$clientProc")
             return
         }
 
         // 4. 处理重定向统计广播 (ACTION_RECORD_REWRITE)
         val batchJson = intent.getStringExtra(EXTRA_REWRITE_BATCH_JSON)
         val singleJson = intent.getStringExtra(EXTRA_REWRITE_RESULT)
-
-        val isAuthorized = hasValidCreator || (
-                isDirectedToModule(intent, context) &&
-                        isPayloadLegitimate(batchJson, singleJson)
-                )
-
-        if (!isAuthorized) {
-            Log.w(TAG, "拒绝未鉴权或伪造的统计广播上报：creatorPackage=$creatorPackage")
+        if (!isPayloadLegitimate(batchJson, singleJson)) {
+            Log.w(TAG, "拒绝非法或被截断的统计广播")
             return
         }
 
-        val reportPkg = creatorPackage ?: intent.getStringExtra(EXTRA_CLIENT_PACKAGE)
-        val reportProc = intent.getStringExtra(EXTRA_CLIENT_PROCESS)?.trim()?.take(128)
+        val reportProc = IpcSecurity.sanitizeSingleLine(intent.getStringExtra(EXTRA_CLIENT_PROCESS), 128)
 
         // 优先处理批量上报
         if (!batchJson.isNullOrEmpty()) {
@@ -179,9 +177,7 @@ class StatsReceiver : BroadcastReceiver() {
                 val results = dtos.take(200).map { it.toDomain() }
                 StatsManager.recordRequests(results, context)
                 StatsManager.recordHeartbeat(context)
-                if (!reportPkg.isNullOrBlank()) {
-                    StatsManager.recordHandshake(pkg = reportPkg, version = null, process = reportProc, context = context)
-                }
+                StatsManager.recordHandshake(pkg = trustedCreator, version = null, process = reportProc, context = context)
                 Log.i(TAG, "通过 Broadcast 成功记录批量重定向 (${results.size} 条)")
                 return
             } catch (e: Exception) {
@@ -196,18 +192,11 @@ class StatsReceiver : BroadcastReceiver() {
                 val result = dto.toDomain()
                 StatsManager.recordRequests(listOf(result), context)
                 StatsManager.recordHeartbeat(context)
-                if (!reportPkg.isNullOrBlank()) {
-                    StatsManager.recordHandshake(pkg = reportPkg, version = null, process = reportProc, context = context)
-                }
+                StatsManager.recordHandshake(pkg = trustedCreator, version = null, process = reportProc, context = context)
                 Log.i(TAG, "通过 Broadcast 成功记录单条重定向: ${result.originalHost} -> ${result.targetHost}")
             } catch (e: Exception) {
                 Log.e(TAG, "Broadcast 记录失败: $e")
             }
         }
-    }
-
-    private fun isDirectedToModule(intent: Intent, context: Context): Boolean {
-        return intent.`package` == context.packageName ||
-                intent.component?.packageName == context.packageName
     }
 }

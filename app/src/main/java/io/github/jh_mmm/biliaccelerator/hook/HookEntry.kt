@@ -1,11 +1,13 @@
 package io.github.jh_mmm.biliaccelerator.hook
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 
+@SuppressLint("NewApi") // PackageLoadedParam defaultClassLoader is supplied by LibXposed, not the Android SDK.
 class HookEntry : XposedModule() {
 
     companion object {
@@ -15,37 +17,6 @@ class HookEntry : XposedModule() {
         var isSelfHookInjected: Boolean = false
             internal set
 
-        private val IGNORED_PROCESS_SUFFIXES = setOf(
-            ":push",
-            ":pushservice",
-            ":channel",
-            ":crash",
-            ":daemon",
-            ":widget",
-            ":widgetprovider",
-            ":miniapp",
-            ":nimble",
-            ":clean",
-            ":sentry",
-            ":account",
-            ":mall",
-            ":patch",
-            ":canary",
-            ":guard"
-        )
-
-        internal fun isRelevantProcess(packageName: String, processName: String?): Boolean {
-            val proc = processName?.trim()?.takeIf { it.isNotEmpty() } ?: return true
-            if (proc == packageName || !proc.contains(':')) return true
-            val suffix = proc.substringAfter(':').lowercase()
-            if (suffix.contains("media") || suffix.contains("player") || suffix.contains("video") || suffix.contains("ijk")) {
-                return true
-            }
-            if (IGNORED_PROCESS_SUFFIXES.any { suffix == it.removePrefix(":") || suffix.startsWith(it.removePrefix(":") + ":") }) {
-                return false
-            }
-            return true
-        }
     }
 
     private fun handleModuleSelfLoaded(param: PackageLoadedParam) {
@@ -93,7 +64,7 @@ class HookEntry : XposedModule() {
         // 2. 目标应用：B站国内版、国际版、Bstar 等
         if (BiliAcceleratorCore.isTargetPackage(packageName)) {
             val processName = RemoteClient.resolveProcessName()
-            if (!isRelevantProcess(packageName, processName)) {
+            if (!ProcessFilter.isRelevantProcess(packageName, processName)) {
                 Log.d(TAG, "Skipping non-player background process: $processName")
                 return
             }
@@ -104,7 +75,9 @@ class HookEntry : XposedModule() {
             captureApplicationContext(packageName, classLoader)
 
             // 放行 Android 9+ 本地回环 127.0.0.1 明文 HTTP 流量限制
-            NetworkSecurityHook.init(this, classLoader)
+            NetworkSecurityHook.init(this, classLoader) {
+                io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted
+            }
 
             // 在媒体播放进程中启动轻量级 BTR 本地回环代理服务
             val config = RemoteClient.fetchConfig()

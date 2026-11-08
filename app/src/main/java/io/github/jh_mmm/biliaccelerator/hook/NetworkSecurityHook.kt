@@ -11,7 +11,7 @@ object NetworkSecurityHook {
     var isHooked: Boolean = false
         internal set
 
-    fun init(module: XposedModule, classLoader: ClassLoader) {
+    fun init(module: XposedModule, classLoader: ClassLoader, isBtrActive: () -> Boolean) {
         try {
             val policyClass = try {
                 classLoader.loadClass("android.security.NetworkSecurityPolicy")
@@ -43,8 +43,7 @@ object NetworkSecurityHook {
             for (m in noArgMethods) {
                 try {
                     module.hook(m).intercept { chain ->
-                        // 允许明文流量兜底
-                        true
+                        if (isBtrActive()) true else chain.proceed()
                     }
                     isHooked = true
                 } catch (_: Throwable) {}

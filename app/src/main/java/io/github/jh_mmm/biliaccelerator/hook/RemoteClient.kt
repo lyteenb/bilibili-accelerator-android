@@ -3,11 +3,15 @@ package io.github.jh_mmm.biliaccelerator.hook
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
 import android.os.Bundle
 import android.util.Log
 import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.IpcSecurity
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
@@ -32,15 +36,21 @@ object RemoteClient {
         Thread(r, "RemoteClient-ReportWorker").apply { isDaemon = true }
     }
 
-    // 1.0.5 经典逻辑：默认 fail-open (enabled = true)，即便目标应用（如国际版）在部分系统上无法访问 Provider，拦截与重定向仍能正常按默认镜像运行
+    // Fail closed until a real cached/provider configuration is available.
+    // This prevents a temporarily unreachable Provider from silently turning
+    // on host rewriting or BTR with hard-coded defaults.
     @Volatile
-    private var cachedConfig: AcceleratorConfig = AcceleratorConfig(enabled = true)
+    private var cachedConfig: AcceleratorConfig = AcceleratorConfig(enabled = false)
+    @Volatile
+    private var hasResolvedConfig = false
     private val lastConfigFetchTime = AtomicLong(0L)
     private val isFetching = AtomicBoolean(false)
+    private val configObserverRegistered = AtomicBoolean(false)
     private const val CONFIG_CACHE_TTL = 30_000L
 
     private val pendingBatch = ConcurrentLinkedQueue<RewriteResult>()
     private const val BATCH_MAX_SIZE = 10
+    private const val MAX_PENDING_BATCH = 200
     private const val FLUSH_INTERVAL_MS = 1500L
     private var pendingFlushFuture: ScheduledFuture<*>? = null
     private val flushLock = Any()
@@ -57,14 +67,25 @@ object RemoteClient {
         }
         appContext = app
 
-        // 从目标 App 私有目录载入历史持久化配置（1.0.5 逻辑，避免冷启动使用硬编码默认镜像）
-        loadConfigFromLocalCache(app)
+        registerConfigObserver(app)
 
-        // 发送启动握手（同步包名、版本，更新看板“等待拦截”活跃状态）
+        // Load the last user-approved configuration first, then make one
+        // synchronous attempt to resolve the current module configuration.
+        // The provider path is local and already existed on the first fetch;
+        // keeping it synchronous avoids dropping the first playback request.
+        loadConfigFromLocalCache(app)
         sendHandshakeAsync(app)
 
-        // 异步拉取最新配置
-        fetchConfigAsync(app)
+        if (!hasResolvedConfig) {
+            val direct = fetchConfigDirect(app)
+            if (direct != null) {
+                applyResolvedConfig(app, direct)
+            } else {
+                fetchConfigAsync(app)
+            }
+        } else {
+            fetchConfigAsync(app)
+        }
     }
 
     fun getContext(): Context? {
@@ -91,6 +112,7 @@ object RemoteClient {
                 val saved = gson.fromJson(json, AcceleratorConfig::class.java)
                 if (saved != null) {
                     cachedConfig = saved
+                    hasResolvedConfig = true
                     Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
                 }
             }
@@ -106,29 +128,53 @@ object RemoteClient {
         } catch (_: Throwable) {}
     }
 
+    val isConfigResolved: Boolean
+        get() = hasResolvedConfig
+
     fun fetchConfig(): AcceleratorConfig {
         val now = System.currentTimeMillis()
         val lastFetch = lastConfigFetchTime.get()
 
-        if (now - lastFetch < CONFIG_CACHE_TTL && lastFetch != 0L) {
+        if (hasResolvedConfig && now - lastFetch < CONFIG_CACHE_TTL && lastFetch != 0L) {
             return cachedConfig
         }
 
-        val context = getContext() ?: return cachedConfig
+        val context = getContext()
+        if (context == null) {
+            return if (hasResolvedConfig) cachedConfig else AcceleratorConfig(enabled = false)
+        }
 
-        // 首次冷启动且尚未获取成功时，执行一次同步直接拉取
-        if (lastFetch == 0L) {
+        // Resolve synchronously once on cold start. Later refreshes are
+        // asynchronous and continue to use the last known good configuration.
+        if (!hasResolvedConfig) {
             val direct = fetchConfigDirect(context)
             if (direct != null) {
-                cachedConfig = direct
-                lastConfigFetchTime.set(now)
-                saveConfigToLocalCache(context, direct)
+                applyResolvedConfig(context, direct)
                 return direct
             }
+            fetchConfigAsync(context)
+            return AcceleratorConfig(enabled = false)
         }
 
         fetchConfigAsync(context)
         return cachedConfig
+    }
+
+    private fun applyResolvedConfig(context: Context, config: AcceleratorConfig) {
+        cachedConfig = config
+        hasResolvedConfig = true
+        lastConfigFetchTime.set(System.currentTimeMillis())
+        saveConfigToLocalCache(context, config)
+        if (config.enabled && config.enableBtr) {
+            io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
+                concurrency = config.btrConcurrency,
+                chunkSizeKb = config.btrChunkSizeKb,
+                autoConcurrency = config.btrAutoConcurrency,
+                autoChunkSize = config.btrAutoChunkSize
+            )
+        } else {
+            io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.stop()
+        }
     }
 
     private fun fetchConfigDirect(context: Context): AcceleratorConfig? {
@@ -149,15 +195,39 @@ object RemoteClient {
         }
     }
 
-    private fun fetchConfigAsync(context: Context) {
+    private fun registerConfigObserver(context: Context) {
+        if (!configObserverRegistered.compareAndSet(false, true)) return
+        try {
+            val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+                override fun onChange(selfChange: Boolean) {
+                    lastConfigFetchTime.set(0L)
+                    fetchConfigAsync(context) { newConfig ->
+                        if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+                            io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.updateParameters(
+                                concurrency = newConfig.btrConcurrency,
+                                chunkSizeKb = newConfig.btrChunkSizeKb,
+                                autoConcurrency = newConfig.btrAutoConcurrency,
+                                autoChunkSize = newConfig.btrAutoChunkSize
+                            )
+                        }
+                    }
+                }
+            }
+            context.contentResolver.registerContentObserver(StatsProvider.CONTENT_URI, true, observer)
+        } catch (e: Throwable) {
+            configObserverRegistered.set(false)
+            Log.w(TAG, "Failed to register config observer", e)
+        }
+    }
+
+    private fun fetchConfigAsync(context: Context, onLoaded: ((AcceleratorConfig) -> Unit)? = null) {
         if (isFetching.compareAndSet(false, true)) {
             configExecutor.execute {
                 try {
                     val config = fetchConfigDirect(context)
                     if (config != null) {
-                        cachedConfig = config
-                        lastConfigFetchTime.set(System.currentTimeMillis())
-                        saveConfigToLocalCache(context, config)
+                        applyResolvedConfig(context, config)
+                        onLoaded?.invoke(config)
                     } else {
                         lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
                     }
@@ -196,7 +266,7 @@ object RemoteClient {
     private fun sendHandshakeDirect(context: Context) {
         val pkgName = context.packageName
         val procName = resolveProcessName(context) ?: pkgName
-        if (!HookEntry.isRelevantProcess(pkgName, procName)) {
+        if (!ProcessFilter.isRelevantProcess(pkgName, procName)) {
             return
         }
         val pm = context.packageManager
@@ -258,6 +328,9 @@ object RemoteClient {
     }
 
     fun notifyRewrite(result: RewriteResult) {
+        while (pendingBatch.size >= MAX_PENDING_BATCH) {
+            pendingBatch.poll()
+        }
         pendingBatch.offer(sanitizeForIpc(result))
 
         if (pendingBatch.size >= BATCH_MAX_SIZE) {
@@ -280,18 +353,18 @@ object RemoteClient {
             changed = result.changed,
             originalUrl = "",
             finalUrl = "",
-            originalHost = result.originalHost,
-            targetHost = result.targetHost,
-            reason = result.reason,
+            originalHost = IpcSecurity.sanitizeSingleLine(result.originalHost, 128) ?: "",
+            targetHost = IpcSecurity.sanitizeSingleLine(result.targetHost, 128) ?: "",
+            reason = IpcSecurity.sanitizeSingleLine(result.reason, 128) ?: "unknown",
             isPcdn = result.isPcdn,
             isMcdn = result.isMcdn,
-            segmentKey = segKey,
+            segmentKey = IpcSecurity.sanitizeSingleLine(segKey, 96) ?: "",
             isBtr = result.isBtr,
-            btrChunks = result.btrChunks,
-            btrBytes = result.btrBytes,
-            btrConcurrency = result.btrConcurrency,
-            btrCdnCount = result.btrCdnCount,
-            btrAvgLatencyMs = result.btrAvgLatencyMs
+            btrChunks = result.btrChunks.coerceIn(0, 1_000_000),
+            btrBytes = result.btrBytes.coerceIn(0L, 1L shl 40),
+            btrConcurrency = result.btrConcurrency.coerceIn(0, 64),
+            btrCdnCount = result.btrCdnCount.coerceIn(0, 64),
+            btrAvgLatencyMs = result.btrAvgLatencyMs.coerceIn(0L, 600_000L)
         )
     }
 

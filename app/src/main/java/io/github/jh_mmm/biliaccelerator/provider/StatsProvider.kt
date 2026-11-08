@@ -7,13 +7,13 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
-import android.os.Process
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import io.github.jh_mmm.biliaccelerator.BuildConfig
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.IpcSecurity
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 
@@ -36,25 +36,28 @@ data class RewriteResultDto(
     val btrAvgLatencyMs: Long? = 0L
 ) {
     fun toDomain(): RewriteResult {
-        val origHost = originalHost?.trim()?.take(256) ?: ""
-        val tgtHost = targetHost?.trim()?.take(256) ?: origHost
-        val safeSegKey = segmentKey?.substringBefore('?')?.substringAfterLast('/')?.trim()?.take(96) ?: ""
+        val origHost = IpcSecurity.sanitizeSingleLine(originalHost, 128) ?: ""
+        val tgtHost = IpcSecurity.sanitizeSingleLine(targetHost, 128) ?: origHost
+        val safeSegKey = IpcSecurity.sanitizeSingleLine(
+            segmentKey?.substringBefore('?')?.substringAfterLast('/'),
+            96
+        ) ?: ""
         return RewriteResult(
             changed = changed ?: false,
             originalUrl = "",
             finalUrl = "",
             originalHost = origHost,
             targetHost = tgtHost,
-            reason = reason?.trim()?.take(128) ?: "unknown",
+            reason = IpcSecurity.sanitizeSingleLine(reason, 128) ?: "unknown",
             isPcdn = isPcdn ?: false,
             isMcdn = isMcdn ?: false,
             segmentKey = safeSegKey,
             isBtr = isBtr ?: false,
-            btrChunks = btrChunks ?: 0,
-            btrBytes = btrBytes ?: 0L,
-            btrConcurrency = btrConcurrency ?: 0,
-            btrCdnCount = btrCdnCount ?: 0,
-            btrAvgLatencyMs = btrAvgLatencyMs ?: 0L
+            btrChunks = (btrChunks ?: 0).coerceIn(0, 1_000_000),
+            btrBytes = (btrBytes ?: 0L).coerceIn(0L, 1L shl 40),
+            btrConcurrency = (btrConcurrency ?: 0).coerceIn(0, 64),
+            btrCdnCount = (btrCdnCount ?: 0).coerceIn(0, 64),
+            btrAvgLatencyMs = (btrAvgLatencyMs ?: 0L).coerceIn(0L, 600_000L)
         )
     }
 }
@@ -106,29 +109,7 @@ class StatsProvider : ContentProvider() {
         }
 
         fun isCallerAuthorized(context: Context, uid: Int): Boolean {
-            val myUid = Process.myUid()
-            if (uid == myUid) return true
-            // 兼容多用户与应用双开分身（如 MIUI/HyperOS 应用双开，appId = uid % 100000）
-            val appId = uid % 100000
-            val myAppId = myUid % 100000
-            if (appId == myAppId) return true
-
-            val pkgs = context.packageManager.getPackagesForUid(uid).orEmpty()
-            if (pkgs.any { BiliAcceleratorCore.isTargetPackage(it) }) return true
-
-            return BiliAcceleratorCore.TARGET_PACKAGES.any { pkg ->
-                try {
-                    val expectedUid = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                        context.packageManager.getPackageUid(pkg, android.content.pm.PackageManager.PackageInfoFlags.of(0))
-                    } else {
-                        @Suppress("DEPRECATION")
-                        context.packageManager.getPackageUid(pkg, 0)
-                    }
-                    expectedUid % 100000 == appId
-                } catch (_: Exception) {
-                    false
-                }
-            }
+            return IpcSecurity.resolveTrustedPackage(context, uid) != null
         }
 
         fun loadConfig(context: Context): AcceleratorConfig {
@@ -143,25 +124,44 @@ class StatsProvider : ContentProvider() {
                 emptyList()
             }
 
-            return AcceleratorConfig(
+            val strategy = sp.getString(KEY_MCDN_STRATEGY, "proxy-all")?.lowercase()
+                ?.takeIf { it in setOf("proxy-all", "proxy-v1", "replace") }
+                ?: "proxy-all"
+            val rawTarget = sp.getString(KEY_TARGET_HOST, BiliAcceleratorCore.defaultTargetHost())
+                ?: BiliAcceleratorCore.defaultTargetHost()
+            val cleanTarget = BiliAcceleratorCore.cleanHost(rawTarget).substringBefore(':').lowercase()
+            val targetHost = if (BiliAcceleratorCore.isBiliCdnHost(cleanTarget) ||
+                BiliAcceleratorCore.isOfficialBiliHost(cleanTarget)
+            ) {
+                cleanTarget
+            } else {
+                BiliAcceleratorCore.defaultTargetHost()
+            }
+
+            val config = AcceleratorConfig(
                 enabled = sp.getBoolean(KEY_ENABLED, true),
-                targetHost = sp.getString(KEY_TARGET_HOST, "upos-sz-mirrorcos.bilivideo.com") ?: "upos-sz-mirrorcos.bilivideo.com",
-                proxyHost = sp.getString(KEY_PROXY_HOST, "proxy-tf-all-ws.bilivideo.com") ?: "proxy-tf-all-ws.bilivideo.com",
+                targetHost = targetHost,
+                proxyHost = sp.getString(KEY_PROXY_HOST, "proxy-tf-all-ws.bilivideo.com")
+                    ?: "proxy-tf-all-ws.bilivideo.com",
                 blockPcdn = sp.getBoolean(KEY_BLOCK_PCDN, true),
                 proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
-                mcdnStrategy = sp.getString(KEY_MCDN_STRATEGY, "proxy-all") ?: "proxy-all",
+                mcdnStrategy = strategy,
                 forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
                 rewriteAkamai = sp.getBoolean(KEY_REWRITE_AKAMAI, false),
                 portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),
                 enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false),
                 enableBtr = sp.getBoolean(KEY_ENABLE_BTR, true),
                 btrAutoConcurrency = sp.getBoolean(KEY_BTR_AUTO_CONCURRENCY, true),
-                btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6),
+                btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6).coerceIn(2, 16),
                 btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
-                btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512),
-                customCdnPool = customPool,
-                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8)
+                btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512).coerceIn(128, 2048),
+                customCdnPool = customPool
+                    .filter { BiliAcceleratorCore.isOfficialBiliHost(it) }
+                    .distinct()
+                    .take(32),
+                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8).coerceIn(1, 32)
             )
+            return config.copy(proxyHost = BiliAcceleratorCore.resolveProxyHost(config))
         }
 
         fun saveConfig(context: Context, config: AcceleratorConfig) {
@@ -205,7 +205,8 @@ class StatsProvider : ContentProvider() {
 
         // 最前置鉴权：未授权调用直接熔断，不执行任何反序列化与业务逻辑
         val uid = Binder.getCallingUid()
-        if (!isCallerAuthorized(ctx, uid)) {
+        val callingPackage = IpcSecurity.resolveTrustedPackage(ctx, uid)
+        if (callingPackage == null) {
             val pkgs = ctx.packageManager.getPackagesForUid(uid).orEmpty()
             log("拒绝调用：method=$method uid=$uid pkgs=${pkgs.joinToString()}")
             return null
@@ -216,15 +217,23 @@ class StatsProvider : ContentProvider() {
 
         // 接收跨进程同步的 Hook 挂载状态（带上限与字段截断约束）
         extras?.getString(EXTRA_HOOK_STATUS_JSON)?.let { hookJson ->
-            try {
-                val mapType = object : TypeToken<Map<String, String?>>() {}.type
-                val rawHookMap: Map<String, String?> = gson.fromJson(hookJson, mapType)
-                val sanitizedMap = rawHookMap.entries
-                    .take(MAX_HOOK_STATUS_ENTRIES)
-                    .filter { it.key.isNotBlank() && it.value != null }
-                    .associate { it.key.trim().take(64) to it.value!!.trim().take(256) }
-                StatsManager.recordHookStatus(sanitizedMap, ctx)
-            } catch (_: Exception) {}
+            if (!IpcSecurity.isJsonSizeAllowed(hookJson, IpcSecurity.MAX_HOOK_JSON_CHARS)) {
+                log("忽略超限 Hook 状态 JSON")
+            } else {
+                try {
+                    val mapType = object : TypeToken<Map<String, String?>>() {}.type
+                    val rawHookMap: Map<String, String?> = gson.fromJson(hookJson, mapType)
+                    val sanitizedMap = rawHookMap.entries
+                        .take(MAX_HOOK_STATUS_ENTRIES)
+                        .filter { it.key.isNotBlank() && it.value != null }
+                        .associate { entry ->
+                            (IpcSecurity.sanitizeSingleLine(entry.key, 64) ?: "") to
+                                (IpcSecurity.sanitizeSingleLine(entry.value, 256) ?: "")
+                        }
+                        .filterKeys { it.isNotEmpty() }
+                    StatsManager.recordHookStatus(sanitizedMap, ctx)
+                } catch (_: Exception) {}
+            }
         }
 
         val response = Bundle()
@@ -233,17 +242,22 @@ class StatsProvider : ContentProvider() {
             METHOD_RECORD_BATCH_REWRITE -> {
                 val json = extras?.getString(EXTRA_REWRITE_BATCH_JSON)
                 if (!json.isNullOrEmpty()) {
-                    try {
-                        val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
-                        val dtos: List<RewriteResultDto> = gson.fromJson(json, listType)
-                        val validResults = dtos.take(MAX_BATCH_SIZE).mapNotNull { it.toDomain() }
-                        StatsManager.recordRequests(validResults, ctx)
-                        StatsManager.recordHeartbeat(ctx)
-                        response.putBoolean(EXTRA_SUCCESS, true)
-                        log("已批量记录媒体请求: ${validResults.size} 条记录 (来自 uid=$uid)")
-                    } catch (e: Exception) {
+                    if (!IpcSecurity.isJsonSizeAllowed(json)) {
                         response.putBoolean(EXTRA_SUCCESS, false)
-                        log("批量记录重定向失败: $e")
+                        log("批量记录重定向失败：JSON 超限")
+                    } else {
+                        try {
+                            val listType = object : TypeToken<List<RewriteResultDto>>() {}.type
+                            val dtos: List<RewriteResultDto> = gson.fromJson(json, listType)
+                            val validResults = dtos.take(MAX_BATCH_SIZE).mapNotNull { it.toDomain() }
+                            StatsManager.recordRequests(validResults, ctx)
+                            StatsManager.recordHeartbeat(ctx)
+                            response.putBoolean(EXTRA_SUCCESS, true)
+                            log("已批量记录媒体请求: ${validResults.size} 条记录 (来自 uid=$uid)")
+                        } catch (e: Exception) {
+                            response.putBoolean(EXTRA_SUCCESS, false)
+                            log("批量记录重定向失败: $e")
+                        }
                     }
                 } else {
                     response.putBoolean(EXTRA_SUCCESS, false)
@@ -256,17 +270,16 @@ class StatsProvider : ContentProvider() {
                 response.putString(EXTRA_CONFIG_JSON, gson.toJson(config))
             }
             METHOD_HANDSHAKE -> {
-                val clientPkg = extras?.getString(EXTRA_CLIENT_PACKAGE)
-                val clientVer = extras?.getString(EXTRA_CLIENT_VERSION)
-                val clientProc = extras?.getString(EXTRA_CLIENT_PROCESS)
+                val clientVer = IpcSecurity.sanitizeSingleLine(extras?.getString(EXTRA_CLIENT_VERSION), 64)
+                val clientProc = IpcSecurity.sanitizeSingleLine(extras?.getString(EXTRA_CLIENT_PROCESS), 128)
                 StatsManager.recordHandshake(
-                    pkg = clientPkg,
+                    pkg = callingPackage,
                     version = clientVer,
                     process = clientProc,
                     context = ctx
                 )
                 response.putBoolean(EXTRA_SUCCESS, true)
-                log("已记录宿主握手心跳: pkg=$clientPkg ver=$clientVer proc=$clientProc (来自 uid=$uid)")
+                log("已记录宿主握手心跳: pkg=$callingPackage ver=$clientVer proc=$clientProc (来自 uid=$uid)")
             }
         }
         return response

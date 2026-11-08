@@ -398,7 +398,7 @@ class BiliAcceleratorCoreTest {
     fun testEffectiveCdnPoolBehavior() {
         val defaultConfig = AcceleratorConfig()
         val defaultPool = BiliAcceleratorCore.getEffectiveCdnPool(defaultConfig)
-        assertEquals(BiliAcceleratorCore.MAINLAND_CANDIDATE_POOL.size, defaultPool.size)
+        assertEquals(defaultConfig.btrCdnPoolSize, defaultPool.size)
         assertTrue(defaultPool.contains("upos-sz-mirrorcos.bilivideo.com"))
 
         // 用户自定义白名单过滤非法与 Akamai 节点，上限 32
@@ -414,5 +414,48 @@ class BiliAcceleratorCoreTest {
         assertTrue(customEffective.contains("upos-sz-mirrorali.bilivideo.com"))
         assertTrue(customEffective.contains("upos-tf-all-hw.bilivideo.com"))
         assertFalse(customEffective.contains("upos-hz-mirrorakam.akamaized.net"))
+    }
+
+    @Test
+    fun testIpcTrustUsesExactPackageNames() {
+        assertTrue(BiliAcceleratorCore.isTrustedIpcPackage("tv.danmaku.bili"))
+        assertTrue(BiliAcceleratorCore.isTrustedIpcPackage("com.bilibili.app.in"))
+        assertTrue(BiliAcceleratorCore.isTrustedIpcPackage("tv.danmaku.bili.pad"))
+        assertTrue(BiliAcceleratorCore.isTrustedIpcPackage("com.bstar.intl.play"))
+        assertFalse(BiliAcceleratorCore.isTrustedIpcPackage("com.bilibili.fake"))
+        assertFalse(BiliAcceleratorCore.isTrustedIpcPackage("com.evil.bilibili.spoof"))
+    }
+
+    @Test
+    fun testCustomProxyHostSafetyAndFallback() {
+        assertTrue(BiliAcceleratorCore.isSafePublicHost("proxy-tf-all-ws.bilivideo.com"))
+        assertFalse(BiliAcceleratorCore.isSafePublicHost("127.0.0.1"))
+        assertFalse(BiliAcceleratorCore.isSafePublicHost("localhost"))
+        assertFalse(BiliAcceleratorCore.isSafePublicHost("router.local"))
+
+        assertTrue(BiliAcceleratorCore.isOfficialBiliHost("upos-sz-mirrorcos.bilivideo.com"))
+        assertTrue(BiliAcceleratorCore.isOfficialBiliHost("upos-hz-mirrorakam.akamaized.net"))
+        assertTrue(BiliAcceleratorCore.isOfficialBiliHost("video-sea.bstarstatic.com"))
+        assertFalse(BiliAcceleratorCore.isOfficialBiliHost("example.com"))
+        assertFalse(BiliAcceleratorCore.isOfficialBiliHost("127.0.0.1"))
+
+        val config = defaultConfig.copy(proxyHost = "127.0.0.1")
+        assertEquals("proxy-tf-all-ws.bilivideo.com", BiliAcceleratorCore.resolveProxyHost(config))
+        assertEquals(
+            "proxy-tf-all-ws.bilivideo.com",
+            BiliAcceleratorCore.resolveProxyHost(defaultConfig.copy(proxyHost = "example.com"))
+        )
+
+        val mcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn"
+        val rewritten = BiliAcceleratorCore.rewriteUrl(mcdnUrl, config)
+        assertTrue(rewritten.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+    }
+
+    @Test
+    fun testDrmCheckRunsBeforeLiveBranch() {
+        val liveDrm = "https://live.bilibili.com/live-stream/123/index.m3u8?widevine=1"
+        val result = BiliAcceleratorCore.rewriteUrl(liveDrm, defaultConfig)
+        assertFalse(result.changed)
+        assertEquals("drm-protected", result.reason)
     }
 }

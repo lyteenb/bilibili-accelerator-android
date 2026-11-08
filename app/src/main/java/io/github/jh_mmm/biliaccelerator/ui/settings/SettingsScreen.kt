@@ -762,6 +762,7 @@ private fun ProxyHostDialog(
     var customHost by rememberSaveable {
         mutableStateOf(if (isPreset) "" else currentHost)
     }
+    var customHostError by rememberSaveable { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -822,25 +823,43 @@ private fun ProxyHostDialog(
                 if (selectedPresetIndex == presets.size) {
                     OutlinedTextField(
                         value = customHost,
-                        onValueChange = { customHost = it },
+                        onValueChange = {
+                            customHost = it
+                            customHostError = false
+                        },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 4.dp, vertical = 6.dp),
                         placeholder = { Text("例: proxy-tf-all-ws.bilivideo.com", fontSize = 13.sp) },
-                        singleLine = true
+                        singleLine = true,
+                        isError = customHostError,
+                        supportingText = {
+                            if (customHostError) {
+                                Text("请输入官方 B 站媒体域名，不能使用 IP、localhost、私网或第三方域名。", fontSize = 12.sp)
+                            }
+                        }
+                    )
+                    Text(
+                        text = "注意：自定义中继仍必须是官方 B 站媒体域名，并会收到包含签名参数的完整媒体 URL。",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                     )
                 }
             }
         },
         confirmButton = {
             TextButton(onClick = {
-                val chosenHost = if (selectedPresetIndex in presets.indices) {
-                    presets[selectedPresetIndex].first
+                if (selectedPresetIndex in presets.indices) {
+                    onSelect(presets[selectedPresetIndex].first)
                 } else {
-                    val cleaned = BiliAcceleratorCore.cleanHost(customHost).substringBefore(':')
-                    cleaned.ifBlank { "proxy-tf-all-ws.bilivideo.com" }
+                    val cleaned = BiliAcceleratorCore.cleanHost(customHost).substringBefore(':').lowercase()
+                    when {
+                        cleaned.isBlank() -> onSelect("proxy-tf-all-ws.bilivideo.com")
+                        BiliAcceleratorCore.isOfficialBiliHost(cleaned) -> onSelect(cleaned)
+                        else -> customHostError = true
+                    }
                 }
-                onSelect(chosenHost)
             }) {
                 Text("确定")
             }

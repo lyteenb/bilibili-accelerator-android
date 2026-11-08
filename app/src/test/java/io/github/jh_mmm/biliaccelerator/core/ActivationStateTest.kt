@@ -448,12 +448,12 @@ class ActivationStateTest {
     @Test
     fun testMultiProcessFilteringAndCrossProcessStatsDedup() {
         val pkg = "tv.danmaku.bili"
-        assertTrue(io.github.jh_mmm.biliaccelerator.hook.HookEntry.isRelevantProcess(pkg, pkg))
-        assertTrue(io.github.jh_mmm.biliaccelerator.hook.HookEntry.isRelevantProcess(pkg, "$pkg:ijkservice"))
-        assertTrue(io.github.jh_mmm.biliaccelerator.hook.HookEntry.isRelevantProcess(pkg, "$pkg:player"))
-        assertFalse(io.github.jh_mmm.biliaccelerator.hook.HookEntry.isRelevantProcess(pkg, "$pkg:push"))
-        assertFalse(io.github.jh_mmm.biliaccelerator.hook.HookEntry.isRelevantProcess(pkg, "$pkg:crash"))
-        assertFalse(io.github.jh_mmm.biliaccelerator.hook.HookEntry.isRelevantProcess(pkg, "$pkg:miniapp"))
+        assertTrue(io.github.jh_mmm.biliaccelerator.hook.ProcessFilter.isRelevantProcess(pkg, pkg))
+        assertTrue(io.github.jh_mmm.biliaccelerator.hook.ProcessFilter.isRelevantProcess(pkg, "$pkg:ijkservice"))
+        assertTrue(io.github.jh_mmm.biliaccelerator.hook.ProcessFilter.isRelevantProcess(pkg, "$pkg:player"))
+        assertFalse(io.github.jh_mmm.biliaccelerator.hook.ProcessFilter.isRelevantProcess(pkg, "$pkg:push"))
+        assertFalse(io.github.jh_mmm.biliaccelerator.hook.ProcessFilter.isRelevantProcess(pkg, "$pkg:crash"))
+        assertFalse(io.github.jh_mmm.biliaccelerator.hook.ProcessFilter.isRelevantProcess(pkg, "$pkg:miniapp"))
 
         // Cross-process segment deduplication within 10s window
         val segUrl = "http://112.34.56.78:8080/upgcxcode/11/22/999888-1-30080.m4s?sign=1"

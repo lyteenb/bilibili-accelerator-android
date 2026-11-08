@@ -41,7 +41,9 @@ object BtrSessionManager {
     ): String {
         cleanupStaleSessions()
         val id = UUID.randomUUID().toString().replace("-", "").take(12)
-        val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
+        val validBackups = backupUrls
+            .filter { BtrHttpSafety.isAllowedUpstreamUrl(it) && it != primaryUrl }
+            .distinct()
         val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
         // 若宿主未传入备用地址，自动合成兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单），确保多源 CDN 并发调度生效
         val finalBackups = if (validBackups.isEmpty()) {
@@ -84,7 +86,9 @@ object BtrSessionManager {
 
     fun updateBackups(sessionId: String, backups: List<String>) {
         val current = sessions[sessionId] ?: return
-        val validBackups = backups.filter { it.isNotBlank() && it != current.primaryUrl }.distinct()
+        val validBackups = backups
+            .filter { BtrHttpSafety.isAllowedUpstreamUrl(it) && it != current.primaryUrl }
+            .distinct()
         val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(current.primaryUrl)
         val isolatedBackups = if (isPrimaryRelay) {
             validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
@@ -103,9 +107,9 @@ object BtrSessionManager {
         if (backups.isEmpty()) return
         val samplePath = extractComparablePath(backups.first())
         if (samplePath.isNotBlank()) {
-            for ((_, session) in sessions) {
+            for ((sessionId, session) in sessions) {
                 if (extractComparablePath(session.primaryUrl) == samplePath) {
-                    session.backupUrls = backups.filter { it.isNotBlank() && it != session.primaryUrl }.distinct()
+                    updateBackups(sessionId, backups)
                     return
                 }
             }
@@ -173,14 +177,20 @@ object BtrSessionManager {
 
     private fun cleanupStaleSessions() {
         val now = System.currentTimeMillis()
-        if (sessions.size > MAX_SESSIONS) {
-            val iterator = sessions.entries.iterator()
-            while (iterator.hasNext()) {
-                val entry = iterator.next()
-                if (now - entry.value.lastAccessed.get() > SESSION_TTL_MS) {
-                    iterator.remove()
-                }
+        val iterator = sessions.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (now - entry.value.lastAccessed.get() > SESSION_TTL_MS) {
+                iterator.remove()
             }
+        }
+
+        // MAX_SESSIONS is a hard cap, not only a trigger for TTL cleanup.
+        // Evict the least-recently-used session if a burst of active streams
+        // would otherwise grow the in-memory session map without bound.
+        while (sessions.size >= MAX_SESSIONS) {
+            val oldest = sessions.entries.minByOrNull { it.value.lastAccessed.get() } ?: break
+            sessions.remove(oldest.key, oldest.value)
         }
     }
 }

@@ -244,7 +244,7 @@ object StatsManager {
     }
 
     internal fun mergeHookStatusEntry(existing: String?, incoming: String): String {
-        val safeVal = incoming.trim().take(256)
+        val safeVal = IpcSecurity.sanitizeSingleLine(incoming, 256) ?: ""
         if (existing != null &&
             !existing.startsWith("未找到") &&
             !existing.startsWith("未挂载") &&
@@ -278,8 +278,7 @@ object StatsManager {
             ensureInitialized(context)
         }
         for ((k, v) in status.entries.take(MAX_HOOK_ENTRIES)) {
-            val safeKey = k.trim().take(64)
-            if (safeKey.isEmpty()) continue
+            val safeKey = IpcSecurity.sanitizeSingleLine(k, 64) ?: continue
             if (hookStatus.size >= MAX_HOOK_ENTRIES && !hookStatus.containsKey(safeKey)) break
             hookStatus[safeKey] = mergeHookStatusEntry(hookStatus[safeKey], v)
         }
@@ -307,15 +306,9 @@ object StatsManager {
         }
         val now = System.currentTimeMillis()
         lastHeartbeat.set(now)
-        if (!pkg.isNullOrBlank()) {
-            connectedClientPackage = pkg.trim().take(128)
-        }
-        if (!version.isNullOrBlank()) {
-            connectedClientVersion = version.trim().take(64)
-        }
-        if (!process.isNullOrBlank()) {
-            connectedClientProcess = process.trim().take(128)
-        }
+        IpcSecurity.sanitizeSingleLine(pkg, 128)?.let { connectedClientPackage = it }
+        IpcSecurity.sanitizeSingleLine(version, 64)?.let { connectedClientVersion = it }
+        IpcSecurity.sanitizeSingleLine(process, 128)?.let { connectedClientProcess = it }
         context?.let { saveHeartbeatToPrefs(it) }
     }
 
@@ -344,9 +337,14 @@ object StatsManager {
 
         if (result.changed) {
             totalRewrites.incrementAndGet()
-            val rawOriginalHost = (result.originalHost ?: "").trim().take(128)
-            val rawTargetHost = (result.targetHost ?: "").trim().take(128)
-            val rawReason = (result.reason ?: "").trim().take(128)
+            val rawOriginalHost = IpcSecurity.sanitizeSingleLine(result.originalHost, 128) ?: ""
+            val rawTargetHost = IpcSecurity.sanitizeSingleLine(result.targetHost, 128) ?: ""
+            val rawReason = IpcSecurity.sanitizeSingleLine(result.reason, 128) ?: "unknown"
+            val safeBtrChunks = result.btrChunks.coerceIn(0, 1_000_000)
+            val safeBtrBytes = result.btrBytes.coerceIn(0L, 1L shl 40)
+            val safeBtrConcurrency = result.btrConcurrency.coerceIn(0, 64)
+            val safeBtrCdnCount = result.btrCdnCount.coerceIn(0, 64)
+            val safeBtrLatency = result.btrAvgLatencyMs.coerceIn(0L, 600_000L)
 
             if (result.isPcdn) {
                 pcdnBlocked.incrementAndGet()
@@ -360,8 +358,8 @@ object StatsManager {
                 mcdnProxied.incrementAndGet()
             }
             if (result.isBtr) {
-                btrTotalChunks.addAndGet(result.btrChunks.toLong())
-                btrTotalBytes.addAndGet(result.btrBytes)
+                addSaturated(btrTotalChunks, safeBtrChunks.toLong())
+                addSaturated(btrTotalBytes, safeBtrBytes)
                 if (result.reason.contains("熔断") || result.reason.contains("failover")) {
                     btrFailoverCount.incrementAndGet()
                 }
@@ -380,11 +378,11 @@ object StatsManager {
                 isPcdn = result.isPcdn,
                 isMcdn = result.isMcdn,
                 isBtr = result.isBtr,
-                btrChunks = result.btrChunks,
-                btrBytes = result.btrBytes,
-                btrConcurrency = result.btrConcurrency,
-                btrCdnCount = result.btrCdnCount,
-                btrAvgLatencyMs = result.btrAvgLatencyMs
+                btrChunks = safeBtrChunks,
+                btrBytes = safeBtrBytes,
+                btrConcurrency = safeBtrConcurrency,
+                btrCdnCount = safeBtrCdnCount,
+                btrAvgLatencyMs = safeBtrLatency
             )
 
             synchronized(logsLock) {
@@ -393,6 +391,13 @@ object StatsManager {
                     recentLogs.removeAt(recentLogs.lastIndex)
                 }
             }
+        }
+    }
+
+    private fun addSaturated(counter: AtomicLong, delta: Long) {
+        if (delta <= 0L) return
+        counter.updateAndGet { current ->
+            if (current > Long.MAX_VALUE - delta) Long.MAX_VALUE else current + delta
         }
     }
 
@@ -558,6 +563,9 @@ object StatsManager {
             if (snapshot.avoidedHosts.size > 20) {
                 sb.appendLine("  ...以及其他 ${snapshot.avoidedHosts.size - 20} 个域名")
             }
+        }
+        if (snapshot.totalRewrites == 0L && snapshot.totalRequests > 0L) {
+            sb.appendLine("未发生重写：媒体请求可能已经是官方/海外直连线路，或当前命中 Akamai 放行策略；可尝试开启 BTR 或调整镜像策略后复测。")
         }
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【最近重定向日志 (前 15 条)】")

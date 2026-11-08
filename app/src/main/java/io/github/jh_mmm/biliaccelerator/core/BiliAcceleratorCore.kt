@@ -71,6 +71,23 @@ object BiliAcceleratorCore {
                 p.startsWith("com.bstar.")
     }
 
+    /**
+     * IPC is stricter than injection scope: only an explicit set of supported
+     * Bilibili packages may read configuration or submit statistics. Keeping
+     * known variants here avoids reintroducing the old arbitrary-prefix trust
+     * while preserving the tablet and Bstar variant paths.
+     */
+    val TRUSTED_IPC_PACKAGES: Set<String> = TARGET_PACKAGES + setOf(
+        "tv.danmaku.bili.pad",
+        "com.bstar.intl.play"
+    )
+
+    fun isTrustedIpcPackage(packageName: String?): Boolean {
+        if (packageName.isNullOrBlank()) return false
+        val p = packageName.trim().lowercase()
+        return PACKAGE_NAME_REGEX.matches(p) && TRUSTED_IPC_PACKAGES.contains(p)
+    }
+
     val MAINLAND_CANDIDATE_POOL = listOf(
         "upos-sz-mirrorcos.bilivideo.com",
         "upos-sz-mirrorcoso1.bilivideo.com",
@@ -118,10 +135,14 @@ object BiliAcceleratorCore {
         }
     }
 
+    fun defaultTargetHost(): String {
+        return if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL.first() else MAINLAND_CANDIDATE_POOL.first()
+    }
+
     fun getEffectiveCdnPool(config: AcceleratorConfig): List<String> {
         val userList = config.customCdnPool
             .map { cleanHost(it).lowercase() }
-            .filter { isValidHost(it) && !isAkamaiHost(it) }
+            .filter { isOfficialBiliHost(it) && !isAkamaiHost(it) }
             .distinct()
         val basePool = if (userList.isNotEmpty()) userList else {
             if (isOverseasEnvironment()) OVERSEAS_CANDIDATE_POOL else MAINLAND_CANDIDATE_POOL
@@ -190,6 +211,31 @@ object BiliAcceleratorCore {
     fun isValidHost(host: String): Boolean {
         if (host.isBlank() || host.length > 253) return false
         return HOSTNAME_REGEX.matches(host)
+    }
+
+    /**
+     * User-supplied CDN/proxy hosts must be public DNS names. Literal IPs,
+     * localhost and mDNS names are rejected before they can be inserted into a
+     * rewritten URL. DNS results are checked again at connection time by the
+     * BTR SafeDns implementation.
+     */
+    fun isSafePublicHost(raw: String?): Boolean {
+        val cleaned = cleanHost(raw).substringBefore(':').lowercase()
+        if (!isValidHost(cleaned)) return false
+        if (isIpAddress(cleaned)) return false
+        return cleaned != "localhost" &&
+            !cleaned.endsWith(".localhost") &&
+            !cleaned.endsWith(".local") &&
+            !cleaned.endsWith(".localdomain") &&
+            !cleaned.endsWith(".lan") &&
+            !cleaned.endsWith(".home") &&
+            !cleaned.endsWith(".home.arpa") &&
+            !cleaned.endsWith(".internal")
+    }
+
+    fun resolveProxyHost(config: AcceleratorConfig): String {
+        val cleaned = cleanHost(config.proxyHost).substringBefore(':').lowercase()
+        return if (isOfficialBiliHost(cleaned)) cleaned else "proxy-tf-all-ws.bilivideo.com"
     }
 
     private val KNOWN_P2P_SUFFIXES = listOf(
@@ -289,6 +335,15 @@ object BiliAcceleratorCore {
                 h.endsWith(".bilivideo.cn") ||
                 h.endsWith(".bilivideo.net") ||
                 isBiliAkamaiHost(h)
+    }
+
+    fun isOfficialBiliHost(raw: String?): Boolean {
+        val h = cleanHost(raw).lowercase().substringBefore(':')
+        return isValidHost(h) && (
+            isBiliCdnHost(h) ||
+                h.endsWith(".bstarstatic.com") ||
+                h.endsWith(".hdslb.com")
+        )
     }
 
     fun isBiliFamilyHost(hostname: String): Boolean {
@@ -459,7 +514,11 @@ object BiliAcceleratorCore {
         val parsed = parseUri(original) ?: return noChange(original, "parse-failed")
         val hostname = parsed.host.lowercase()
         val segKey = extractSegmentKey(parsed.path)
-        val cleanProxyHost = cleanHost(config.proxyHost).substringBefore(':').ifBlank { "proxy-tf-all-ws.bilivideo.com" }
+        if (hasDrmSignal(original)) {
+            return noChange(original, "drm-protected", isPcdn = false, isMcdn = false, segmentKey = segKey)
+        }
+
+        val cleanProxyHost = resolveProxyHost(config)
         if (hostname == cleanProxyHost) {
             return noChange(original, "already-proxied", isMcdn = true)
         }
@@ -516,11 +575,6 @@ object BiliAcceleratorCore {
             } else {
                 noChange(original, "live-ok", isPcdn = false, isMcdn = false, segmentKey = segKey)
             }
-        }
-
-        // 关键防护：版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH/UGC付费等）必须原生直连放行，严禁改写域名
-        if (hasDrmSignal(original)) {
-            return noChange(original, "drm-protected", isPcdn = false, isMcdn = false, segmentKey = segKey)
         }
 
         // 2. MCDN 节点处理：支持 proxy-all / proxy-v1 / replace 多档策略颗粒度
@@ -633,6 +687,7 @@ object BiliAcceleratorCore {
         val isLiveList = rawList.any { isLiveMediaUrl("", it) }
         val target = config.targetHost
         val filtered = mutableListOf<String>()
+        var hasCleanOfficial = false
 
         if (isLiveList) {
             // 直播流候选过滤：
@@ -659,11 +714,14 @@ object BiliAcceleratorCore {
                 filtered.add(res.finalUrl)
             } else if (!res.isPcdn || !config.blockPcdn) {
                 filtered.add(url)
+                if (isOfficialBiliHost(parseUri(url)?.host)) {
+                    hasCleanOfficial = true
+                }
             }
         }
 
         val sampleUrl = rawList.firstOrNull()
-        if (filtered.isEmpty() && sampleUrl != null) {
+        if (!hasCleanOfficial && sampleUrl != null) {
             // 对齐 BTR Issue #47：中继/MCDN 地址、DRM 加密地址与 Akamai 地址严禁作为 Donor 生成普通 UPOS 镜像
             if (!isRelayUrl(sampleUrl) && !isAkamaiHost(sampleUrl) && !hasDrmSignal(sampleUrl)) {
                 val candidates = CANDIDATE_POOL.filter { it != target }

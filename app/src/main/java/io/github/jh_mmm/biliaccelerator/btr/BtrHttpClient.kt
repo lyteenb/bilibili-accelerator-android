@@ -4,6 +4,7 @@ import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 object BtrHttpClient {
@@ -35,11 +36,19 @@ object BtrHttpClient {
         .dispatcher(createDispatcher(128, 32))
         .connectionPool(connectionPool)
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .dns(SafeDns)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            if (!BtrHttpSafety.isAllowedUpstreamUrl(request.url.toString())) {
+                throw IOException("Blocked unsafe upstream URL")
+            }
+            chain.proceed(request)
+        }
         .connectTimeout(3500, TimeUnit.MILLISECONDS)
         .readTimeout(6000, TimeUnit.MILLISECONDS)
         .writeTimeout(5000, TimeUnit.MILLISECONDS)
         .followRedirects(true)
-        .followSslRedirects(true)
+        .followSslRedirects(false)
         .retryOnConnectionFailure(false) // 由 BtrChunkEngine 统一控制 Failover 与熔断
         .build()
 
@@ -48,11 +57,19 @@ object BtrHttpClient {
         .dispatcher(createDispatcher(32, 16))
         .connectionPool(audioConnectionPool)
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .dns(SafeDns)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            if (!BtrHttpSafety.isAllowedUpstreamUrl(request.url.toString())) {
+                throw IOException("Blocked unsafe upstream URL")
+            }
+            chain.proceed(request)
+        }
         .connectTimeout(3000, TimeUnit.MILLISECONDS)
         .readTimeout(5000, TimeUnit.MILLISECONDS)
         .writeTimeout(5000, TimeUnit.MILLISECONDS)
         .followRedirects(true)
-        .followSslRedirects(true)
+        .followSslRedirects(false)
         .retryOnConnectionFailure(false)
         .build()
 
