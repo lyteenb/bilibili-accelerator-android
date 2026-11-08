@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.btr
 
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import org.junit.Assert.assertEquals
@@ -136,8 +137,33 @@ class BtrEngineTest {
         val relay3 = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s?os=mcdn"
 
         assertTrue("Relay URL with /v1/resource/ must not synthesize UPOS mirrors", BtrSessionManager.synthesizeCompatibleBackups(relay1).isEmpty())
-        assertTrue("Proxy URL must not synthesize UPOS mirrors", BtrSessionManager.synthesizeCompatibleBackups(relay2).isEmpty())
+        val relay2Backups = BtrSessionManager.synthesizeCompatibleBackups(relay2)
+        assertTrue("Proxy wrapper should synthesize relay backups", relay2Backups.isNotEmpty())
+        assertTrue("Proxy wrapper backups must remain official relay hosts", relay2Backups.all { it.startsWith("https://proxy-tf-all-") })
         assertTrue("URL with os=mcdn must not synthesize UPOS mirrors", BtrSessionManager.synthesizeCompatibleBackups(relay3).isEmpty())
+    }
+
+    @Test
+    fun testProxyRelaySynthesizesAlternateOfficialRelayHosts() {
+        val primary = "https://proxy-tf-all-ws.bilivideo.com/?url=http%3A%2F%2Fxy.mcdn.bilivideo.cn%2Fv1%2Fresource%2F123.m4s"
+        val backups = BtrSessionManager.synthesizeCompatibleBackups(
+            primary,
+            AcceleratorConfig(btrCdnPoolSize = 8)
+        )
+        assertEquals(2, backups.size)
+        assertTrue(backups.any { it.startsWith("https://proxy-tf-all-tx.bilivideo.com/") })
+        assertTrue(backups.any { it.startsWith("https://proxy-tf-all-hw.bilivideo.com/") })
+        assertFalse(backups.any { it.startsWith("https://proxy-tf-all-ws.bilivideo.com/") })
+        assertTrue(backups.all { it.contains("url=http%3A%2F%2Fxy.mcdn.bilivideo.cn") })
+
+        val sessionId = BtrSessionManager.register(
+            primary,
+            emptyList(),
+            config = AcceleratorConfig(btrCdnPoolSize = 8)
+        )
+        val sessionBackups = BtrSessionManager.get(sessionId)?.backupUrls.orEmpty()
+        assertEquals(2, sessionBackups.size)
+        assertTrue(sessionBackups.all { BiliAcceleratorCore.isRelayUrl(it) })
     }
 
     @Test
@@ -230,6 +256,7 @@ class BtrEngineTest {
             autoConcurrency = true,
             isAudio = false,
             isSingleRelay = false,
+            isRelayFamily = false,
             memoryBoundPrefetch = 16
         )
         assertEquals(8, multi.burst)
@@ -240,16 +267,29 @@ class BtrEngineTest {
             autoConcurrency = true,
             isAudio = false,
             isSingleRelay = true,
+            isRelayFamily = false,
             memoryBoundPrefetch = 16
         )
         assertEquals(4, singleRelay.burst)
         assertEquals(4, singleRelay.steady)
+
+        val relayFamily = BtrChunkEngine.calculateConcurrencyCaps(
+            requestedConcurrency = 6,
+            autoConcurrency = true,
+            isAudio = false,
+            isSingleRelay = false,
+            isRelayFamily = true,
+            memoryBoundPrefetch = 16
+        )
+        assertEquals(8, relayFamily.burst)
+        assertEquals(4, relayFamily.steady)
 
         val audio = BtrChunkEngine.calculateConcurrencyCaps(
             requestedConcurrency = 16,
             autoConcurrency = true,
             isAudio = true,
             isSingleRelay = false,
+            isRelayFamily = false,
             memoryBoundPrefetch = 16
         )
         assertEquals(2, audio.burst)
@@ -260,6 +300,7 @@ class BtrEngineTest {
             autoConcurrency = true,
             isAudio = false,
             isSingleRelay = false,
+            isRelayFamily = false,
             memoryBoundPrefetch = 8
         )
         assertEquals(8, memoryBound.burst)
@@ -270,6 +311,7 @@ class BtrEngineTest {
             autoConcurrency = false,
             isAudio = false,
             isSingleRelay = false,
+            isRelayFamily = false,
             memoryBoundPrefetch = 16
         )
         assertEquals(6, manual.burst)

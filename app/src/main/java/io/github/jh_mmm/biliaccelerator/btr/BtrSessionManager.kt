@@ -46,14 +46,22 @@ object BtrSessionManager {
             .distinct()
         val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
         // 若宿主未传入备用地址，自动合成兼容的官方同源 UPOS 镜像（优先支持用户自定义 CDN 白名单），确保多源 CDN 并发调度生效
+        val relayBackups = if (isPrimaryRelay) {
+            synthesizeRelayWrapperBackups(primaryUrl, config)
+        } else {
+            emptyList()
+        }
+        val poolLimit = config?.btrCdnPoolSize?.coerceIn(1, 32) ?: 8
         val finalBackups = if (validBackups.isEmpty()) {
-            synthesizeCompatibleBackups(primaryUrl, config)
+            relayBackups.ifEmpty { synthesizeCompatibleBackups(primaryUrl, config) }
         } else {
             // 隔离检查（对齐 BTR 规范）：
             // 若当前主地址是中继流，严禁混入普通 UPOS 镜像；
             // 若当前主地址是普通 UPOS 流，严禁混入中继地址（避免触发普通节点 403）
             if (isPrimaryRelay) {
-                validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+                (validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) } + relayBackups)
+                    .distinct()
+                    .take(poolLimit)
             } else {
                 validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
             }
@@ -98,7 +106,9 @@ object BtrSessionManager {
             .distinct()
         val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(current.primaryUrl)
         val isolatedBackups = if (isPrimaryRelay) {
-            validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
+            val relayBackups = synthesizeRelayWrapperBackups(current.primaryUrl, null)
+            (validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) } + relayBackups)
+                .distinct()
         } else {
             validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) }
         }
@@ -146,6 +156,9 @@ object BtrSessionManager {
      * 解决海外/大陆多源并发拉取，彻底杜绝 403 熔断。
      */
     fun synthesizeCompatibleBackups(primaryUrl: String, config: AcceleratorConfig? = null): List<String> {
+        val relayBackups = synthesizeRelayWrapperBackups(primaryUrl, config)
+        if (relayBackups.isNotEmpty()) return relayBackups
+
         val results = mutableListOf<String>()
         val uri = BiliAcceleratorCore.parseUri(primaryUrl) ?: return emptyList()
         val path = uri.path
@@ -198,6 +211,25 @@ object BtrSessionManager {
             if (results.size >= maxBackups) break
         }
         return results
+    }
+
+    private fun synthesizeRelayWrapperBackups(
+        primaryUrl: String,
+        config: AcceleratorConfig?
+    ): List<String> {
+        val uri = BiliAcceleratorCore.parseUri(primaryUrl) ?: return emptyList()
+        val host = BiliAcceleratorCore.cleanHost(uri.host).lowercase()
+        if (!host.startsWith("proxy-tf-all-")) return emptyList()
+        if (uri.path.isNotBlank() && uri.path != "/") return emptyList()
+        if (uri.queryParam("url").isNullOrBlank()) return emptyList()
+
+        val preferred = config?.proxyHost?.let { BiliAcceleratorCore.cleanHost(it).lowercase() }
+        val candidates = (listOfNotNull(preferred) + BiliAcceleratorCore.OFFICIAL_RELAY_HOSTS)
+            .map { BiliAcceleratorCore.cleanHost(it).lowercase() }
+            .filter { it.startsWith("proxy-tf-all-") && it != host }
+            .distinct()
+        val limit = config?.btrCdnPoolSize?.coerceIn(1, 32) ?: candidates.size
+        return candidates.take(limit).map { candidate -> uri.replaceAuthority(candidate) }
     }
 
     private fun cleanupStaleSessions() {

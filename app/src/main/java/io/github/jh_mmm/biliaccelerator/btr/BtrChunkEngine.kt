@@ -122,7 +122,7 @@ object BtrChunkEngine {
             val prefix = if (sessionId.startsWith("audio_") || primaryHost.contains("audio")) "BTR音频优化" else "BTR并发加速"
             val summaryReason = "$prefix · ${count}分片(${mbStr}MB) · ${hitHosts.size}个CDN · 均时${avgLatency}ms"
             val concurrencyLabel = if (burstConcurrency > concurrency) {
-                "${concurrency}→${burstConcurrency}线程"
+                "冲刺${burstConcurrency}/稳定${concurrency}线程"
             } else {
                 "${concurrency}线程"
             }
@@ -158,17 +158,19 @@ object BtrChunkEngine {
         autoConcurrency: Boolean,
         isAudio: Boolean,
         isSingleRelay: Boolean,
+        isRelayFamily: Boolean,
         memoryBoundPrefetch: Int
     ): BtrConcurrencyCaps {
         val memoryCap = memoryBoundPrefetch.coerceIn(1, MAX_PREFETCH_CHUNKS)
         val requested = requestedConcurrency.coerceIn(2, 16)
         val steady = when {
             isAudio -> AUDIO_MAX_CONCURRENCY
-            isSingleRelay -> minOf(requested, SINGLE_RELAY_CONCURRENCY_CAP)
+            isSingleRelay || isRelayFamily -> minOf(requested, SINGLE_RELAY_CONCURRENCY_CAP)
             else -> requested
         }.coerceAtMost(memoryCap)
         val burst = when {
             isAudio || !autoConcurrency || isSingleRelay -> steady
+            isRelayFamily -> maxOf(steady, 8).coerceAtMost(16)
             else -> maxOf(steady, 8).coerceAtMost(16)
         }.coerceAtMost(memoryCap)
         return BtrConcurrencyCaps(burst = burst, steady = steady)
@@ -239,6 +241,9 @@ object BtrChunkEngine {
         val isSingleRelay = candidateHosts.size <= 1 &&
                 (BiliAcceleratorCore.isRelayUrl(session.primaryUrl) ||
                         candidateHosts.any { it.startsWith("proxy-tf-all-") })
+        val isRelayFamily = candidateUrls.size > 1 && candidateUrls.all {
+            BiliAcceleratorCore.isRelayUrl(it)
+        }
         val useAuto = !isAudio && autoConcurrency
         val initialMemoryBound = (MAX_MEMORY_PREFETCH_BYTES / initialProbeChunkSize)
             .toInt()
@@ -248,6 +253,7 @@ object BtrChunkEngine {
             autoConcurrency = autoConcurrency,
             isAudio = isAudio,
             isSingleRelay = isSingleRelay,
+            isRelayFamily = isRelayFamily,
             memoryBoundPrefetch = initialMemoryBound
         )
         val primaryHost = BiliAcceleratorCore.cleanHost(extractHostname(session.primaryUrl))
@@ -329,6 +335,7 @@ object BtrChunkEngine {
                 autoConcurrency = autoConcurrency,
                 isAudio = isAudio,
                 isSingleRelay = isSingleRelay,
+                isRelayFamily = isRelayFamily,
                 memoryBoundPrefetch = activeMemoryBound
             )
             statsTracker.concurrency = concurrencyCaps.steady

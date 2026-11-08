@@ -120,6 +120,12 @@ object BiliAcceleratorCore {
     val CANDIDATE_POOL = MAINLAND_CANDIDATE_POOL
     val DEFAULT_CDN_POOL = CANDIDATE_POOL
 
+    val OFFICIAL_RELAY_HOSTS = listOf(
+        "proxy-tf-all-ws.bilivideo.com",
+        "proxy-tf-all-tx.bilivideo.com",
+        "proxy-tf-all-hw.bilivideo.com"
+    )
+
     /**
      * 判断当前系统是否处于海外环境（根据时区与语言环境自适应加权）
      */
