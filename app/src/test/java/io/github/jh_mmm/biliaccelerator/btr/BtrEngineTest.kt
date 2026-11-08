@@ -164,6 +164,28 @@ class BtrEngineTest {
         val sessionBackups = BtrSessionManager.get(sessionId)?.backupUrls.orEmpty()
         assertEquals(2, sessionBackups.size)
         assertTrue(sessionBackups.all { BiliAcceleratorCore.isRelayUrl(it) })
+
+        val tencentPrimary = "https://proxy-tf-all-tx.bilivideo.com/?url=http%3A%2F%2Fxy.mcdn.bilivideo.cn%2Fv1%2Fresource%2F456.m4s"
+        val tencentBackups = BtrSessionManager.synthesizeCompatibleBackups(
+            tencentPrimary,
+            AcceleratorConfig(proxyHost = "proxy-tf-all-tx.bilivideo.com", btrCdnPoolSize = 8)
+        )
+        assertEquals(2, tencentBackups.size)
+        assertTrue(tencentBackups.any { it.startsWith("https://proxy-tf-all-ws.bilivideo.com/") })
+        assertTrue(tencentBackups.any { it.startsWith("https://proxy-tf-all-hw.bilivideo.com/") })
+        assertFalse(tencentBackups.any { it.startsWith("https://proxy-tf-all-tx.bilivideo.com/") })
+    }
+
+    @Test
+    fun testDnsFailureUsesLongBackoff() {
+        assertEquals(
+            300_000L,
+            BtrChunkEngine.penaltyForFailureMessage(
+                "Unable to resolve host \"proxy-tf-all-tx.bilivideo.com\": No address associated with hostname"
+            )
+        )
+        assertEquals(120_000L, BtrChunkEngine.penaltyForFailureMessage("Blocked unsafe upstream URL: host foo"))
+        assertEquals(30_000L, BtrChunkEngine.penaltyForFailureMessage("unexpected end of stream"))
     }
 
     @Test

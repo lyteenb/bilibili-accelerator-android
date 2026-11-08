@@ -832,9 +832,12 @@ object BtrChunkEngine {
         return if (code == 403) 60_000L else 30_000L
     }
 
-    private fun penaltyForFailureMessage(message: String): Long {
+    internal fun penaltyForFailureMessage(message: String): Long {
         val lower = message.lowercase(Locale.ROOT)
         return when {
+            lower.contains("unable to resolve host") ||
+                lower.contains("no address associated") ||
+                lower.contains("no address returned") -> 300_000L
             lower.contains("blocked unsafe upstream") -> 120_000L
             lower.contains("unexpected end") -> 30_000L
             lower.contains("timeout") || lower.contains("timed out") -> 30_000L
