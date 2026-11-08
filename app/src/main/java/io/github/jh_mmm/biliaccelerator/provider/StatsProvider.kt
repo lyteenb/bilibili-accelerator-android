@@ -16,6 +16,7 @@ import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.IpcSecurity
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 传输层 DTO，防范反射反序列化导致的不可信字段与 NPE，且绝不接收完整签名 URL（仅传输裸域名）
@@ -101,8 +102,10 @@ class StatsProvider : ContentProvider() {
         const val KEY_BTR_CHUNK_SIZE_KB = "cfg_btr_chunk_size_kb"
         const val KEY_CUSTOM_CDN_POOL = "cfg_custom_cdn_pool"
         const val KEY_BTR_CDN_POOL_SIZE = "cfg_btr_cdn_pool_size"
+        const val KEY_ENABLE_DEBUG_LOGGING = "cfg_enable_debug_logging"
 
         private val gson = Gson()
+        private val debugSettingInitialized = AtomicBoolean(false)
 
         private fun log(msg: String) {
             Log.i("BiliAccelerator-Stats", msg)
@@ -159,7 +162,8 @@ class StatsProvider : ContentProvider() {
                     .filter { BiliAcceleratorCore.isOfficialBiliHost(it) }
                     .distinct()
                     .take(32),
-                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8).coerceIn(1, 32)
+                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8).coerceIn(1, 32),
+                enableDebugLogging = sp.getBoolean(KEY_ENABLE_DEBUG_LOGGING, false)
             )
             return config.copy(proxyHost = BiliAcceleratorCore.resolveProxyHost(config))
         }
@@ -184,7 +188,9 @@ class StatsProvider : ContentProvider() {
                 .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
                 .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(config.customCdnPool))
                 .putInt(KEY_BTR_CDN_POOL_SIZE, config.btrCdnPoolSize)
+                .putBoolean(KEY_ENABLE_DEBUG_LOGGING, config.enableDebugLogging)
                 .apply()
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(config.enableDebugLogging)
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)
             }
@@ -214,6 +220,11 @@ class StatsProvider : ContentProvider() {
 
         // 鉴权通过后惰性初始化统计管理器
         StatsManager.ensureInitialized(ctx)
+        if (debugSettingInitialized.compareAndSet(false, true)) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(
+                loadConfig(ctx).enableDebugLogging
+            )
+        }
 
         // 接收跨进程同步的 Hook 挂载状态（带上限与字段截断约束）
         extras?.getString(EXTRA_HOOK_STATUS_JSON)?.let { hookJson ->

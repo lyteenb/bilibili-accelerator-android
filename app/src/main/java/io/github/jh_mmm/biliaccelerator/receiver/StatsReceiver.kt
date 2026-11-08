@@ -13,6 +13,8 @@ import io.github.jh_mmm.biliaccelerator.core.IpcSecurity
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import io.github.jh_mmm.biliaccelerator.provider.RewriteResultDto
+import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
+import java.util.concurrent.atomic.AtomicBoolean
 
 class StatsReceiver : BroadcastReceiver() {
 
@@ -29,6 +31,7 @@ class StatsReceiver : BroadcastReceiver() {
 
         private const val TAG = "BiliAccelerator-StatsReceiver"
         private val gson = Gson()
+        private val debugSettingInitialized = AtomicBoolean(false)
 
         private val VALID_REASONS = setOf(
             "szbdyd-source",
@@ -123,6 +126,11 @@ class StatsReceiver : BroadcastReceiver() {
         }
 
         StatsManager.ensureInitialized(context)
+        if (debugSettingInitialized.compareAndSet(false, true)) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(
+                StatsProvider.loadConfig(context).enableDebugLogging
+            )
+        }
 
         // 3. 处理独立握手广播 (ACTION_HANDSHAKE)
         if (action == ACTION_HANDSHAKE) {

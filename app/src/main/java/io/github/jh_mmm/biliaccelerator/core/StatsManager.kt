@@ -47,6 +47,7 @@ data class StatsSnapshot(
     val recentLogs: List<RewriteLogEntry> = emptyList(),
     val installedAt: String = "",
     val lastHeartbeatTimestamp: Long = 0L,
+    val lastRewriteTimestamp: Long = 0L,
     val hookStatus: Map<String, String> = emptyMap(),
     val isFrameworkActivated: Boolean = false,
     val clientPackage: String? = null,
@@ -54,7 +55,9 @@ data class StatsSnapshot(
     val clientProcess: String? = null,
     val frameworkScope: List<String> = emptyList(),
     val hasTargetScope: Boolean = false,
-    val hasQueriedScope: Boolean = false
+    val hasQueriedScope: Boolean = false,
+    val scopeQueriedAt: Long = 0L,
+    val hasRuntimeHeartbeat: Boolean = false
 )
 
 object StatsManager {
@@ -93,9 +96,12 @@ object StatsManager {
     private val btrTotalBytes = AtomicLong(0L)
     private val btrFailoverCount = AtomicLong(0L)
     private val lastHeartbeat = AtomicLong(0L)
+    private val lastRewriteTimestamp = AtomicLong(0L)
+    private val runtimeHeartbeatObserved = AtomicBoolean(false)
     private val frameworkInjected = AtomicBoolean(false)
     private val frameworkScope = java.util.concurrent.CopyOnWriteArrayList<String>()
     private val hasQueriedScopeFlag = AtomicBoolean(false)
+    private val scopeQueriedAt = AtomicLong(0L)
     private val avoidedHosts = ConcurrentHashMap.newKeySet<String>()
     private val recentLogs = ArrayList<RewriteLogEntry>()
     private val logsLock = Any()
@@ -217,16 +223,36 @@ object StatsManager {
     val isFrameworkSelfInjected: Boolean
         get() = frameworkInjected.get()
 
+    val isRuntimeHeartbeatObserved: Boolean
+        get() = runtimeHeartbeatObserved.get()
+
+    fun invalidateFrameworkRuntimeState() {
+        val hadRuntimeHeartbeat = runtimeHeartbeatObserved.getAndSet(false)
+        val hadRuntimeRewrite = lastRewriteTimestamp.getAndSet(0L) > 0L
+        val hadRuntimeEvidence = hadRuntimeHeartbeat || hadRuntimeRewrite
+        frameworkInjected.set(false)
+        frameworkScope.clear()
+        hasQueriedScopeFlag.set(false)
+        scopeQueriedAt.set(0L)
+        if (hadRuntimeEvidence) {
+            DebugEventBuffer.record("FRAMEWORK", "runtime evidence invalidated")
+        }
+    }
 
     fun recordFrameworkScope(scope: List<String>) {
         frameworkScope.clear()
         frameworkScope.addAll(scope)
         hasQueriedScopeFlag.set(true)
+        val now = System.currentTimeMillis()
+        scopeQueriedAt.set(now)
+        val targetCount = scope.count { BiliAcceleratorCore.isTargetPackage(it) }
+        DebugEventBuffer.record("FRAMEWORK", "scopeQueried count=${scope.size} targetCount=$targetCount")
     }
 
     fun clearFrameworkScope() {
         frameworkScope.clear()
         hasQueriedScopeFlag.set(false)
+        scopeQueriedAt.set(0L)
     }
 
     val frameworkScopeList: List<String>
@@ -240,6 +266,10 @@ object StatsManager {
             ensureInitialized(context)
         }
         lastHeartbeat.set(System.currentTimeMillis())
+        val firstRuntimeHeartbeat = !runtimeHeartbeatObserved.getAndSet(true)
+        if (firstRuntimeHeartbeat) {
+            DebugEventBuffer.record("HEARTBEAT", "first current-process heartbeat")
+        }
         context?.let { saveHeartbeatToPrefs(it) }
     }
 
@@ -306,9 +336,16 @@ object StatsManager {
         }
         val now = System.currentTimeMillis()
         lastHeartbeat.set(now)
+        val firstRuntimeHeartbeat = !runtimeHeartbeatObserved.getAndSet(true)
+        if (firstRuntimeHeartbeat) {
+            DebugEventBuffer.record("HEARTBEAT", "first current-process heartbeat from handshake")
+        }
         IpcSecurity.sanitizeSingleLine(pkg, 128)?.let { connectedClientPackage = it }
         IpcSecurity.sanitizeSingleLine(version, 64)?.let { connectedClientVersion = it }
         IpcSecurity.sanitizeSingleLine(process, 128)?.let { connectedClientProcess = it }
+        if (!pkg.isNullOrBlank()) {
+            DebugEventBuffer.record("HANDSHAKE", "pkg=$pkg version=${version ?: "unknown"} process=${process ?: "unknown"}")
+        }
         context?.let { saveHeartbeatToPrefs(it) }
     }
 
@@ -317,6 +354,12 @@ object StatsManager {
         if (context != null) {
             ensureInitialized(context)
         }
+        val firstRuntimeHeartbeat = !runtimeHeartbeatObserved.getAndSet(true)
+        if (firstRuntimeHeartbeat) {
+            DebugEventBuffer.record("HEARTBEAT", "first current-process heartbeat from request batch")
+        }
+        lastHeartbeat.set(System.currentTimeMillis())
+        DebugEventBuffer.record("BATCH", "received results=${results.size} accepted=${results.take(MAX_BATCH_SIZE).size}")
         for (result in results.take(MAX_BATCH_SIZE)) {
             try {
                 recordSingleInternal(result)
@@ -334,9 +377,16 @@ object StatsManager {
             return
         }
         totalRequests.incrementAndGet()
+        DebugEventBuffer.record(
+            "ROUTE",
+            "changed=${result.changed} reason=${result.reason} source=${BiliAcceleratorCore.formatHostForDisplay(result.originalHost)} " +
+                "target=${result.targetHost} pcdn=${result.isPcdn} mcdn=${result.isMcdn} btr=${result.isBtr} " +
+                "segment=${result.segmentKey.take(32)}"
+        )
 
         if (result.changed) {
             totalRewrites.incrementAndGet()
+            lastRewriteTimestamp.set(now)
             val rawOriginalHost = IpcSecurity.sanitizeSingleLine(result.originalHost, 128) ?: ""
             val rawTargetHost = IpcSecurity.sanitizeSingleLine(result.targetHost, 128) ?: ""
             val rawReason = IpcSecurity.sanitizeSingleLine(result.reason, 128) ?: "unknown"
@@ -451,6 +501,8 @@ object StatsManager {
             btrTotalChunks.set(0L)
             btrTotalBytes.set(0L)
             btrFailoverCount.set(0L)
+            lastRewriteTimestamp.set(0L)
+            DebugEventBuffer.clear()
             // 注意：不重置 lastHeartbeat 与 hookStatus，避免指标清零连带将模块健康与激活状态误打回“未激活”
             avoidedHosts.clear()
             synchronized(logsLock) {
@@ -491,6 +543,7 @@ object StatsManager {
             recentLogs = synchronized(logsLock) { recentLogs.toList() },
             installedAt = installedAt,
             lastHeartbeatTimestamp = lastHeartbeat.get(),
+            lastRewriteTimestamp = lastRewriteTimestamp.get(),
             hookStatus = HashMap(hookStatus),
             isFrameworkActivated = frameworkInjected.get(),
             clientPackage = connectedClientPackage,
@@ -498,7 +551,9 @@ object StatsManager {
             clientProcess = connectedClientProcess,
             frameworkScope = scopeList,
             hasTargetScope = hasTarget,
-            hasQueriedScope = hasQueriedScopeFlag.get()
+            hasQueriedScope = hasQueriedScopeFlag.get(),
+            scopeQueriedAt = scopeQueriedAt.get(),
+            hasRuntimeHeartbeat = runtimeHeartbeatObserved.get()
         )
     }
 
@@ -518,7 +573,24 @@ object StatsManager {
         } else {
             "无心跳记录"
         }
-        sb.appendLine("最近活跃心跳: $lastHbDesc")
+        val heartbeatEvidence = if (snapshot.lastHeartbeatTimestamp > 0L) {
+            if (snapshot.hasRuntimeHeartbeat) "$lastHbDesc (本次进程)" else "$lastHbDesc (历史记录)"
+        } else {
+            "无心跳记录"
+        }
+        sb.appendLine("最近活跃心跳: $heartbeatEvidence")
+        val scopeQueryDesc = if (snapshot.scopeQueriedAt > 0L) {
+            LocalDateTime.ofInstant(Instant.ofEpochMilli(snapshot.scopeQueriedAt), ZoneId.systemDefault()).format(installTimeFormatter)
+        } else {
+            "无"
+        }
+        sb.appendLine("作用域最近查询: $scopeQueryDesc")
+        val lastRewriteDesc = if (snapshot.lastRewriteTimestamp > 0L) {
+            LocalDateTime.ofInstant(Instant.ofEpochMilli(snapshot.lastRewriteTimestamp), ZoneId.systemDefault()).format(installTimeFormatter)
+        } else {
+            "本次进程暂无重写"
+        }
+        sb.appendLine("最近真实重写: $lastRewriteDesc")
         if (snapshot.hasQueriedScope) {
             sb.appendLine("LSPosed 模块作用域: ${if (snapshot.frameworkScope.isEmpty()) "未勾选任何应用" else snapshot.frameworkScope.joinToString(", ")}")
         }
@@ -535,6 +607,7 @@ object StatsManager {
         sb.appendLine("强制统一线路: ${if (config.forceUpos) "开启" else "关闭"}")
         sb.appendLine("端口启发式: ${if (config.portHeuristic) "开启" else "关闭"}")
         sb.appendLine("Moss gRPC 注入: ${if (config.enableMossHook) "开启 (实验性)" else "关闭 (默认)"}")
+        sb.appendLine("Debug 日志: ${if (config.enableDebugLogging) "开启" else "关闭"}")
         sb.appendLine("-----------------------------------------")
         sb.appendLine("【Hook 挂载状态】")
         try {
@@ -558,7 +631,7 @@ object StatsManager {
         if (snapshot.avoidedHosts.isNotEmpty()) {
             sb.appendLine("规避域名列表: ")
             snapshot.avoidedHosts.take(20).forEach { host ->
-                sb.appendLine("  - $host")
+                sb.appendLine("  - ${BiliAcceleratorCore.formatHostForDisplay(host)}")
             }
             if (snapshot.avoidedHosts.size > 20) {
                 sb.appendLine("  ...以及其他 ${snapshot.avoidedHosts.size - 20} 个域名")
@@ -573,7 +646,7 @@ object StatsManager {
             sb.appendLine("暂无重定向记录")
         } else {
             snapshot.recentLogs.take(15).forEach { log ->
-                sb.appendLine("[${log.timeFormatted}] 原因: ${log.reason} | ${log.originalHost} -> ${log.targetHost}")
+                sb.appendLine("[${log.timeFormatted}] 原因: ${log.reason} | ${BiliAcceleratorCore.formatHostForDisplay(log.originalHost)} -> ${log.targetHost}")
             }
         }
         sb.appendLine("=========================================")

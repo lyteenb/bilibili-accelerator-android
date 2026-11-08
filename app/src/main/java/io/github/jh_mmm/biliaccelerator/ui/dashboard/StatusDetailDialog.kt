@@ -49,15 +49,23 @@ fun StatusDetailDialog(
             snapshot.isFrameworkActivated
 
     val now = System.currentTimeMillis()
-    val hasRecentHeartbeat = snapshot.lastHeartbeatTimestamp > 0L &&
+    val hasRecentHeartbeat = snapshot.hasRuntimeHeartbeat &&
+            snapshot.lastHeartbeatTimestamp > 0L &&
             (now - snapshot.lastHeartbeatTimestamp) in 0..MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS
+    val hasFreshScope = MainActivity.isScopeQueryFresh(snapshot.scopeQueriedAt, now)
 
     val lastHbDesc = if (snapshot.lastHeartbeatTimestamp > 0L) {
         val formatted = LocalDateTime.ofInstant(
             Instant.ofEpochMilli(snapshot.lastHeartbeatTimestamp),
             ZoneId.systemDefault()
         ).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-        if (hasRecentHeartbeat) "$formatted (活跃)" else "$formatted (已超时离线)"
+        if (hasRecentHeartbeat) {
+            "$formatted (当前会话活跃)"
+        } else if (snapshot.hasRuntimeHeartbeat) {
+            "$formatted (已超时离线)"
+        } else {
+            "$formatted (历史记录，非当前会话)"
+        }
     } else {
         "暂无记录"
     }
@@ -82,6 +90,7 @@ fun StatusDetailDialog(
                     text = when (state) {
                         ActivationState.ACTIVE_EFFECTIVE -> "● 运行状态：已生效 (运行正常)"
                         ActivationState.ACTIVE_HEARTBEAT -> "● 运行状态：等待拦截 (等待流量)"
+                        ActivationState.FRAMEWORK_READY -> "● 运行状态：框架已连接 (等待 B站当前会话验证)"
                         ActivationState.INACTIVE -> "● 运行状态：未激活"
                     },
                     fontWeight = FontWeight.SemiBold,
@@ -89,6 +98,7 @@ fun StatusDetailDialog(
                     color = when (state) {
                         ActivationState.ACTIVE_EFFECTIVE -> MaterialTheme.colorScheme.primary
                         ActivationState.ACTIVE_HEARTBEAT -> MaterialTheme.colorScheme.tertiary
+                        ActivationState.FRAMEWORK_READY -> MaterialTheme.colorScheme.tertiary
                         ActivationState.INACTIVE -> MaterialTheme.colorScheme.error
                     }
                 )
@@ -101,15 +111,17 @@ fun StatusDetailDialog(
                         ActivationState.ACTIVE_HEARTBEAT -> {
                             val clientName = if (!snapshot.clientPackage.isNullOrEmpty()) {
                                 "${snapshot.clientPackage} (v${snapshot.clientVersion ?: "就绪"})"
-                            } else if (snapshot.hasTargetScope) {
-                                snapshot.frameworkScope.filter { io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.isTargetPackage(it) }.joinToString(", ")
                             } else {
                                 "哔哩哔哩客户端"
                             }
-                            "监控目标：$clientName\n模块已就绪并处于等待拦截状态，播放任意视频即可开始加速。"
+                            "监控目标：$clientName\n已收到当前模块进程中的 B站心跳，播放任意视频即可开始加速。"
                         }
+                        ActivationState.FRAMEWORK_READY ->
+                            "LSPosed 的 Service 在线且作用域包含 B站，但本次模块进程还没有收到当前 B站会话心跳。\n\n这只能说明框架连接存在，不能证明模块开关当前已生效。请启动或切回哔哩哔哩播放任意视频；若已在 LSPosed 中关闭模块，请强制停止哔哩哔哩和本应用后重新打开。"
                         ActivationState.INACTIVE -> {
-                            if (isServiceBound && snapshot.hasQueriedScope && !snapshot.hasTargetScope) {
+                            if (isServiceBound && !hasFreshScope) {
+                                "框架服务已连接，但当前作用域信息尚未确认或已经过期。\n\n请点击刷新；若刚在 LSPosed 中关闭模块，请强制停止哔哩哔哩和本应用后重新打开。"
+                            } else if (isServiceBound && snapshot.hasQueriedScope && !snapshot.hasTargetScope) {
                                 val scopeListDesc = if (snapshot.frameworkScope.isEmpty()) {
                                     "（当前未勾选任何应用）"
                                 } else {
@@ -139,10 +151,11 @@ fun StatusDetailDialog(
                 )
                 Spacer(Modifier.height(4.dp))
                 val frameworkDesc = when {
-                    isSelfInjected -> "已挂载 (LSPosed 作用域生效)"
-                    isServiceBound -> "已连接 (现代系统服务)"
-                    hasRecentHeartbeat && !snapshot.clientPackage.isNullOrEmpty() -> "已建立通信 (来自 ${snapshot.clientPackage})"
-                    snapshot.lastHeartbeatTimestamp > 0L -> "通信离线 (最近会话: $lastHbDesc)"
+                    isServiceBound && hasFreshScope -> "已连接 (作用域已确认)"
+                    isServiceBound -> "已连接 (作用域待确认或已过期)"
+                    isSelfInjected -> "检测到自注入 (可能是旧进程，不能证明当前已启用)"
+                    hasRecentHeartbeat && !snapshot.clientPackage.isNullOrEmpty() -> "当前会话通信正常 (来自 ${snapshot.clientPackage})"
+                    snapshot.lastHeartbeatTimestamp > 0L -> "当前会话未收到心跳 (最近记录: $lastHbDesc)"
                     else -> "未连接"
                 }
                 val scopeDesc = if (snapshot.hasQueriedScope) {

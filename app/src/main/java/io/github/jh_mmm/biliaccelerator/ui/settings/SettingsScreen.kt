@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.AltRoute
 import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Palette
@@ -100,6 +101,7 @@ fun SettingsScreen(
     onUiPreferencesChange: (UiPreferences) -> Unit,
     onClearStats: () -> Unit,
     onExportDiagnostic: () -> Unit,
+    onDownloadDebugReport: () -> Unit,
     uposEntries: List<String>,
     uposValues: List<String>,
     bottomContentPadding: Dp = 80.dp
@@ -397,11 +399,31 @@ fun SettingsScreen(
                         }
                         item(key = "card-diag") {
                             PreferenceGroupCard {
+                                PreferenceSwitchItem(
+                                    title = stringResource(R.string.label_enable_debug_logging),
+                                    summary = stringResource(R.string.summary_enable_debug_logging),
+                                    checked = config.enableDebugLogging,
+                                    onCheckedChange = { onConfigChange(config.copy(enableDebugLogging = it)) },
+                                    icon = Icons.Outlined.BugReport
+                                )
+
+                                PreferenceDivider()
+
                                 PreferenceActionItem(
                                     title = stringResource(R.string.btn_export_diag),
                                     summary = stringResource(R.string.summary_export_diag),
                                     icon = Icons.Outlined.ContentCopy,
                                     onClick = onExportDiagnostic
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceActionItem(
+                                    title = stringResource(R.string.btn_download_debug_report),
+                                    summary = stringResource(R.string.summary_download_debug_report),
+                                    icon = Icons.Outlined.BugReport,
+                                    onClick = onDownloadDebugReport,
+                                    enabled = config.enableDebugLogging
                                 )
 
                                 PreferenceDivider()

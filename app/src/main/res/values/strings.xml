@@ -15,7 +15,7 @@
     <string name="label_speed_test">测试 UPOS 镜像速度</string>
     <string name="summary_speed_test">测试各镜像节点延迟并推荐最佳线路</string>
     <string name="label_enable_pcdn_block">拦截 PCDN 调度节点</string>
-    <string name="summary_enable_pcdn_block">阻断低质 P2P/CDN 调度，回退至官方高质量骨干网</string>
+    <string name="summary_enable_pcdn_block">仅对点播阻断低质 P2P/CDN 调度，直播保持原样直通</string>
     <string name="label_enable_mcdn_proxy">MCDN 官方代理中继</string>
     <string name="summary_enable_mcdn_proxy">将边缘小运营商节点中继至官方高速 CDN 代理</string>
     <string name="label_proxy_host">MCDN 中继代理节点</string>
@@ -37,11 +37,16 @@
     <string name="btn_clear_stats">清空统计数据</string>
     <string name="summary_clear_stats">重置总重定向、拦截及已规避节点记录</string>
     <string name="btn_export_diag">复制诊断报告</string>
+    <string name="label_enable_debug_logging">开启 Debug 日志</string>
+    <string name="summary_enable_debug_logging">仅在测试排障时开启；记录有界运行时事件、路由决策、框架状态与 BTR 汇总，关闭后会清空本次调试事件</string>
+    <string name="btn_download_debug_report">下载 Debug 报告</string>
     <string name="summary_export_diag">一键导出系统环境、配置与 Hook 挂载报告</string>
+    <string name="summary_download_debug_report">需先开启 Debug 日志；生成包含完整配置、统计、Hook 状态、运行事件时间线及最近 100 条重写日志的详细报告，保存到 Download 文件夹</string>
     <string name="status_active">LSPosed 模块已激活</string>
     <string name="status_inactive">模块未激活（请在 LSPosed 中启用本模块并勾选哔哩哔哩作用域）</string>
     <string name="status_badge_in_effect">已生效</string>
     <string name="status_badge_active">等待拦截</string>
+    <string name="status_badge_ready">待验证</string>
     <string name="status_badge_inactive">未激活</string>
     <string name="title_status_detail">模块状态与诊断</string>
     <string name="dialog_clear_title">确认清空</string>
@@ -52,6 +57,10 @@
     <string name="dialog_ok">确定</string>
     <string name="toast_stats_cleared">统计数据已清空</string>
     <string name="toast_diag_copied">诊断报告已复制到剪贴板！</string>
+    <string name="toast_debug_report_saved">Debug 报告已保存到 %1$s</string>
+    <string name="toast_debug_report_failed">保存 Debug 报告失败：%1$s</string>
+    <string name="toast_debug_report_disabled">请先在设置中开启 Debug 日志</string>
+    <string name="toast_debug_report_in_progress">Debug 报告正在生成，请稍候</string>
     <string name="toast_log_copied">日志信息已复制到剪贴板</string>
     <string name="speed_test_dialog_title">UPOS 镜像测速</string>
     <string name="speed_test_testing_desc">正在并发探测各节点 HTTPS 握手与首包响应时延...</string>

@@ -86,6 +86,13 @@ object BtrSessionManager {
 
     fun updateBackups(sessionId: String, backups: List<String>) {
         val current = sessions[sessionId] ?: return
+        if (backups.any { BiliAcceleratorCore.isLiveMediaUrl("", it) }) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "rejected live backups session=${sessionId.take(6)} count=${backups.size}"
+            )
+            return
+        }
         val validBackups = backups
             .filter { BtrHttpSafety.isAllowedUpstreamUrl(it) && it != current.primaryUrl }
             .distinct()
@@ -105,6 +112,13 @@ object BtrSessionManager {
 
     fun updateBackupsByCandidateUrls(backups: List<String>) {
         if (backups.isEmpty()) return
+        if (backups.any { BiliAcceleratorCore.isLiveMediaUrl("", it) }) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "rejected live candidate backup list count=${backups.size}"
+            )
+            return
+        }
         val samplePath = extractComparablePath(backups.first())
         if (samplePath.isNotBlank()) {
             for ((sessionId, session) in sessions) {
@@ -114,7 +128,12 @@ object BtrSessionManager {
                 }
             }
         }
-        updateBackupsForLatest(backups)
+        // Never fall back to the most recently created session when the media
+        // path does not match. That could mix unrelated VOD/live resources.
+        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+            "BTR",
+            "unmatched backup list ignored path=${samplePath.take(48)}"
+        )
     }
 
     private fun extractComparablePath(url: String): String {

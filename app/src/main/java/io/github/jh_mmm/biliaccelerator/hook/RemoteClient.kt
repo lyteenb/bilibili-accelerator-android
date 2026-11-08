@@ -113,6 +113,7 @@ object RemoteClient {
                 if (saved != null) {
                     cachedConfig = saved
                     hasResolvedConfig = true
+                    io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(saved.enableDebugLogging)
                     Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
                 }
             }
@@ -163,6 +164,7 @@ object RemoteClient {
     private fun applyResolvedConfig(context: Context, config: AcceleratorConfig) {
         cachedConfig = config
         hasResolvedConfig = true
+        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(config.enableDebugLogging)
         lastConfigFetchTime.set(System.currentTimeMillis())
         saveConfigToLocalCache(context, config)
         if (config.enabled && config.enableBtr) {

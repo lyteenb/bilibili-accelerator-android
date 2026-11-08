@@ -28,7 +28,9 @@ class ActivationStateTest {
             recentLogs = emptyList(),
             installedAt = "2026-10-07 18:00:00",
             lastHeartbeatTimestamp = 1760000000000L,
-            isFrameworkActivated = true
+            lastRewriteTimestamp = 1760000000001L,
+            isFrameworkActivated = true,
+            hasRuntimeHeartbeat = true
         )
 
         val json = gson.toJson(snapshot)
@@ -37,7 +39,9 @@ class ActivationStateTest {
         assertEquals(snapshot.totalRequests, deserialized.totalRequests)
         assertEquals(snapshot.totalRewrites, deserialized.totalRewrites)
         assertEquals(snapshot.lastHeartbeatTimestamp, deserialized.lastHeartbeatTimestamp)
+        assertEquals(snapshot.lastRewriteTimestamp, deserialized.lastRewriteTimestamp)
         assertTrue(deserialized.isFrameworkActivated)
+        assertTrue(deserialized.hasRuntimeHeartbeat)
     }
 
     @Test
@@ -58,7 +62,19 @@ class ActivationStateTest {
         assertEquals(50L, deserialized.totalRequests)
         assertEquals(10L, deserialized.totalRewrites)
         assertEquals(0L, deserialized.lastHeartbeatTimestamp)
+        assertEquals(0L, deserialized.lastRewriteTimestamp)
+        assertEquals(0L, deserialized.scopeQueriedAt)
+        assertFalse(deserialized.hasRuntimeHeartbeat)
         assertFalse(deserialized.isFrameworkActivated)
+    }
+
+    @Test
+    fun testScopeQueryFreshnessWindow() {
+        val now = 1_760_000_000_000L
+        assertFalse(MainActivity.isScopeQueryFresh(0L, now))
+        assertTrue(MainActivity.isScopeQueryFresh(now - 10_000L, now))
+        assertFalse(MainActivity.isScopeQueryFresh(now - MainActivity.SCOPE_QUERY_FRESHNESS_MS - 1L, now))
+        assertFalse("Future timestamps must not be trusted", MainActivity.isScopeQueryFresh(now + 1_000L, now))
     }
 
     @Test
@@ -76,9 +92,9 @@ class ActivationStateTest {
     }
 
     @Test
-    fun testCalculateActivationStateSelfInjectedInLsposedScope() {
+    fun testSelfInjectionAloneDoesNotProveCurrentActivation() {
         val now = 1_760_000_000_000L
-        // LSPosed 开启并勾选作用域后自注入生效：即使尚未运行哔哩哔哩且无流量 -> 必须直接处于激活待命中状态 (ACTIVE_HEARTBEAT)
+        // 自注入状态可能残留在旧进程中，关闭模块后不能单独作为当前生效凭据。
         val stateSelfInjected = MainActivity.calculateActivationState(
             totalRewrites = 0L,
             isServiceBound = false,
@@ -87,8 +103,8 @@ class ActivationStateTest {
             now = now
         )
         assertEquals(
-            "LSPosed scope enabled with self-injection must show activated state",
-            ActivationState.ACTIVE_HEARTBEAT,
+            "Stale self-injection alone must not show activated state",
+            ActivationState.INACTIVE,
             stateSelfInjected
         )
     }
@@ -97,8 +113,7 @@ class ActivationStateTest {
     fun testCalculateActivationStateLsposedScopeBoundWaitingForTraffic() {
         val now = 1_760_000_000_000L
 
-        // 勾选即等待拦截：LSPosed 中启用模块后，服务实时在线绑定且作用域包含目标应用 (isServiceBound = true, hasFrameworkScope = true)，
-        // 在未产生视频重写时必须判定为“等待拦截” (ACTIVE_HEARTBEAT)
+        // Service 和新鲜作用域只能证明框架连接；没有当前 B站心跳时只能显示“框架已连接/待验证”。
         val stateWaitingForTraffic = MainActivity.calculateActivationState(
             totalRewrites = 0L,
             isServiceBound = true,
@@ -108,12 +123,12 @@ class ActivationStateTest {
             now = now
         )
         assertEquals(
-            "LSPosed enabled with service bound and target scope must be ACTIVE_HEARTBEAT (等待拦截)",
-            ActivationState.ACTIVE_HEARTBEAT,
+            "Service bound with fresh scope and no current heartbeat must be FRAMEWORK_READY",
+            ActivationState.FRAMEWORK_READY,
             stateWaitingForTraffic
         )
 
-        // 产生视频重定向后，状态流转为已生效 (ACTIVE_EFFECTIVE)
+        // 只有历史重写、没有本次进程实时心跳时，仍只能显示框架待验证。
         val stateEffective = MainActivity.calculateActivationState(
             totalRewrites = 10L,
             isServiceBound = true,
@@ -123,8 +138,8 @@ class ActivationStateTest {
             now = now
         )
         assertEquals(
-            "Service bound with rewrites must be ACTIVE_EFFECTIVE (已生效)",
-            ActivationState.ACTIVE_EFFECTIVE,
+            "Historical rewrites without a runtime heartbeat must only show FRAMEWORK_READY",
+            ActivationState.FRAMEWORK_READY,
             stateEffective
         )
 
@@ -189,11 +204,13 @@ class ActivationStateTest {
             isServiceBound = false,
             lastHeartbeat = recentHeartbeat,
             isSelfInjected = false,
+            hasRuntimeHeartbeat = true,
+            lastRewriteTimestamp = recentHeartbeat,
             now = now
         )
-        assertEquals("Recent heartbeat with rewrites must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateRecentHb)
+        assertEquals("Recent runtime heartbeat and rewrite must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateRecentHb)
 
-        // 模块自身被框架注入且有历史重定向 -> ACTIVE_EFFECTIVE
+        // 旧进程中的自注入标记和历史重写不能证明当前仍生效。
         val stateSelfInjectedWithRewrites = MainActivity.calculateActivationState(
             totalRewrites = 20L,
             isServiceBound = false,
@@ -201,7 +218,7 @@ class ActivationStateTest {
             isSelfInjected = true,
             now = now
         )
-        assertEquals("Self-injected module with rewrites must be ACTIVE_EFFECTIVE", ActivationState.ACTIVE_EFFECTIVE, stateSelfInjectedWithRewrites)
+        assertEquals("Stale self-injection with historical rewrites must be INACTIVE", ActivationState.INACTIVE, stateSelfInjectedWithRewrites)
     }
 
     @Test
@@ -209,27 +226,59 @@ class ActivationStateTest {
         val now = 1_760_000_000_000L
         val recentHeartbeat = now - 60_000L // 1 分钟前
 
-        // 服务已绑定但尚无重写 -> ACTIVE_HEARTBEAT
+        // 服务已绑定但尚无当前心跳 -> FRAMEWORK_READY
         assertEquals(
-            ActivationState.ACTIVE_HEARTBEAT,
+            ActivationState.FRAMEWORK_READY,
             MainActivity.calculateActivationState(totalRewrites = 0L, isServiceBound = true, lastHeartbeat = 0L, now = now)
         )
 
-        // 近期有心跳但尚无重写 -> ACTIVE_HEARTBEAT
+        // 只有持久化心跳、没有当前进程实时证据 -> INACTIVE
         assertEquals(
-            ActivationState.ACTIVE_HEARTBEAT,
+            ActivationState.INACTIVE,
             MainActivity.calculateActivationState(totalRewrites = 0L, isServiceBound = false, lastHeartbeat = recentHeartbeat, now = now)
         )
 
-        // 近期有心跳且有重写 -> ACTIVE_EFFECTIVE
+        // 当前进程近期有心跳但尚无重写 -> ACTIVE_HEARTBEAT
         assertEquals(
-            ActivationState.ACTIVE_EFFECTIVE,
-            MainActivity.calculateActivationState(totalRewrites = 5L, isServiceBound = false, lastHeartbeat = recentHeartbeat, now = now)
+            ActivationState.ACTIVE_HEARTBEAT,
+            MainActivity.calculateActivationState(
+                totalRewrites = 0L,
+                isServiceBound = false,
+                lastHeartbeat = recentHeartbeat,
+                hasRuntimeHeartbeat = true,
+                now = now
+            )
         )
 
-        // 服务已绑定且有重写 -> ACTIVE_EFFECTIVE
+        // 当前进程近期有心跳，但只有历史重写、没有近期真实重写 -> ACTIVE_HEARTBEAT
+        assertEquals(
+            ActivationState.ACTIVE_HEARTBEAT,
+            MainActivity.calculateActivationState(
+                totalRewrites = 5L,
+                isServiceBound = false,
+                lastHeartbeat = recentHeartbeat,
+                hasRuntimeHeartbeat = true,
+                lastRewriteTimestamp = 0L,
+                now = now
+            )
+        )
+
+        // 当前进程近期有心跳且确实发生新重写 -> ACTIVE_EFFECTIVE
         assertEquals(
             ActivationState.ACTIVE_EFFECTIVE,
+            MainActivity.calculateActivationState(
+                totalRewrites = 5L,
+                isServiceBound = false,
+                lastHeartbeat = recentHeartbeat,
+                hasRuntimeHeartbeat = true,
+                lastRewriteTimestamp = recentHeartbeat,
+                now = now
+            )
+        )
+
+        // 服务已绑定且有历史重写，但没有近期运行时心跳 -> 只能等待当前会话验证
+        assertEquals(
+            ActivationState.FRAMEWORK_READY,
             MainActivity.calculateActivationState(totalRewrites = 5L, isServiceBound = true, lastHeartbeat = 0L, now = now)
         )
     }
@@ -305,17 +354,44 @@ class ActivationStateTest {
         // 测试绑定状态流转：设置存活 binder 后 isServiceBound 为 true，并同步作用域
         XposedServiceProvider.setServiceBoundForTesting(true, validBinder, listOf("tv.danmaku.bili"))
         assertTrue("Service bound state must be true", XposedServiceProvider.isServiceBound)
+        assertTrue("Valid current binder must be accepted for scope query", XposedServiceProvider.isScopeQuerySourceCurrent(validBinder))
+        assertFalse("A different binder must be rejected for scope query", XposedServiceProvider.isScopeQuerySourceCurrent(invalidBinder))
         val snapshotWithScope = StatsManager.getSnapshot()
         assertTrue("Scope must be marked queried", snapshotWithScope.hasQueriedScope)
+        assertTrue("Scope query timestamp must be current", snapshotWithScope.scopeQueriedAt > 0L)
         assertTrue("Scope must detect target package", snapshotWithScope.hasTargetScope)
         assertEquals(listOf("tv.danmaku.bili"), snapshotWithScope.frameworkScope)
 
-        // 测试 Binder 死亡回调：重置 isServiceBound 并清空作用域
+        // Binder 存活期间收到的心跳和真实重写属于当前运行时证据
+        StatsManager.recordRequests(
+            listOf(
+                RewriteResult(
+                    changed = true,
+                    originalUrl = "http://112.34.56.78:8080/upgcxcode/1/2/video.m4s",
+                    finalUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/video.m4s",
+                    originalHost = "112.34.56.78",
+                    targetHost = "upos-sz-mirrorcos.bilivideo.com",
+                    reason = "pcdn-host",
+                    isPcdn = true,
+                    isMcdn = false,
+                    segmentKey = "activation-test-segment"
+                )
+            )
+        )
+        assertTrue("Runtime heartbeat should be observed before binder death", StatsManager.isRuntimeHeartbeatObserved)
+        assertTrue("Recent rewrite evidence should be recorded", StatsManager.getSnapshot().lastRewriteTimestamp > 0L)
+
+        // 测试 Binder 死亡回调：重置 isServiceBound、运行时证据并清空作用域
         XposedServiceProvider.triggerBinderDiedForTesting()
         assertFalse("Service bound state must be false after binder died", XposedServiceProvider.isServiceBound)
+        assertFalse("Dead binder must not be accepted for scope query", XposedServiceProvider.isScopeQuerySourceCurrent(validBinder))
+        assertFalse("Runtime heartbeat must be invalidated after binder died", StatsManager.isRuntimeHeartbeatObserved)
         val snapshotAfterDeath = StatsManager.getSnapshot()
         assertFalse("Scope queried flag must be false after binder died", snapshotAfterDeath.hasQueriedScope)
+        assertEquals("Scope query timestamp must be cleared after binder died", 0L, snapshotAfterDeath.scopeQueriedAt)
         assertFalse("Target scope flag must be false after binder died", snapshotAfterDeath.hasTargetScope)
+        assertFalse("Runtime heartbeat snapshot must be false after binder died", snapshotAfterDeath.hasRuntimeHeartbeat)
+        assertEquals("Recent rewrite evidence must be cleared after binder died", 0L, snapshotAfterDeath.lastRewriteTimestamp)
         assertTrue("Scope list must be empty after binder died", snapshotAfterDeath.frameworkScope.isEmpty())
 
         // 重置/解绑后置回 false
@@ -329,12 +405,14 @@ class ActivationStateTest {
         var snapshot = StatsManager.getSnapshot()
         assertFalse(snapshot.hasQueriedScope)
         assertFalse(snapshot.hasTargetScope)
+        assertEquals(0L, snapshot.scopeQueriedAt)
         assertTrue(snapshot.frameworkScope.isEmpty())
 
         // 记录包含 B 站的作用域列表
         StatsManager.recordFrameworkScope(listOf("com.other.app", "tv.danmaku.bili"))
         snapshot = StatsManager.getSnapshot()
         assertTrue(snapshot.hasQueriedScope)
+        assertTrue("Scope query must have a timestamp", snapshot.scopeQueriedAt > 0L)
         assertTrue("Must detect tv.danmaku.bili as target package", snapshot.hasTargetScope)
         assertEquals(listOf("com.other.app", "tv.danmaku.bili"), snapshot.frameworkScope)
 
@@ -349,6 +427,7 @@ class ActivationStateTest {
         snapshot = StatsManager.getSnapshot()
         assertFalse(snapshot.hasQueriedScope)
         assertFalse(snapshot.hasTargetScope)
+        assertEquals(0L, snapshot.scopeQueriedAt)
         assertTrue(snapshot.frameworkScope.isEmpty())
     }
 

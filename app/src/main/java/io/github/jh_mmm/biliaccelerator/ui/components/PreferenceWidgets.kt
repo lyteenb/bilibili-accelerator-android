@@ -233,12 +233,13 @@ fun PreferenceActionItem(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
-    tintColor: Color? = null
+    tintColor: Color? = null,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -246,7 +247,7 @@ fun PreferenceActionItem(
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = tintColor ?: MaterialTheme.colorScheme.primary,
+                tint = (tintColor ?: MaterialTheme.colorScheme.primary).copy(alpha = if (enabled) 1f else 0.35f),
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(12.dp))
@@ -260,14 +261,14 @@ fun PreferenceActionItem(
                 text = title,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
-                color = tintColor ?: MaterialTheme.colorScheme.onSurface
+                color = (tintColor ?: MaterialTheme.colorScheme.onSurface).copy(alpha = if (enabled) 1f else 0.35f)
             )
             if (!summary.isNullOrEmpty()) {
                 Spacer(Modifier.height(2.dp))
                 Text(
                     text = summary,
                     fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 1f else 0.35f),
                     lineHeight = 16.sp
                 )
             }
@@ -276,7 +277,7 @@ fun PreferenceActionItem(
         Icon(
             imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
             contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (enabled) 0.6f else 0.2f),
             modifier = Modifier.size(20.dp)
         )
     }

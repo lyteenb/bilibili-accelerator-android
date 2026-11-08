@@ -298,6 +298,19 @@ class BiliAcceleratorCoreTest {
     }
 
     @Test
+    fun testFormatHostForDisplayMarksLoopbackProxy() {
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("127.0.0.1"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("127.0.0.1:34111"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("localhost:8080"))
+        assertFalse(BiliAcceleratorCore.isLoopbackHost("d1--cn-gotcha204b.bilivideo.com"))
+        assertFalse("Domain beginning with 127 must not be treated as loopback", BiliAcceleratorCore.isLoopbackHost("127.example.com"))
+        assertEquals("本地代理 (127.0.0.1)", BiliAcceleratorCore.formatHostForDisplay("127.0.0.1"))
+        assertEquals("本地代理 (127.0.0.1:34111)", BiliAcceleratorCore.formatHostForDisplay("127.0.0.1:34111"))
+        assertEquals("本地代理 (localhost:8080)", BiliAcceleratorCore.formatHostForDisplay("localhost:8080"))
+        assertEquals("d1--cn-gotcha204b.bilivideo.com", BiliAcceleratorCore.formatHostForDisplay("d1--cn-gotcha204b.bilivideo.com"))
+    }
+
+    @Test
     fun testCleanHostProtocolRelative() {
         assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("//upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
         assertEquals("upos-sz-mirrorali.bilivideo.com", BiliAcceleratorCore.cleanHost("https://upos-sz-mirrorali.bilivideo.com/live/1.m4s"))
@@ -305,32 +318,37 @@ class BiliAcceleratorCoreTest {
     }
 
     @Test
-    fun testLiveMediaPcdnDetectionAndRecovery() {
-        // 直播 PCDN 携带源站参数时恢复真源站
+    fun testLiveMediaAlwaysPassesThrough() {
         val liveWithSource = "http://xy123.szbdyd.com:8080/live-bvc/123/live.flv?xy_usource=d1--cn-gotcha01.bilivideo.com"
         val resSource = BiliAcceleratorCore.rewriteUrl(liveWithSource, defaultConfig)
-        assertTrue("Live stream with source parameter should recover source", resSource.changed)
-        assertTrue(resSource.finalUrl.startsWith("https://d1--cn-gotcha01.bilivideo.com/live-bvc/123/live.flv"))
-        assertEquals("live-szbdyd-source", resSource.reason)
+        assertFalse("Live stream with scheduler source must remain untouched", resSource.changed)
+        assertEquals(liveWithSource, resSource.finalUrl)
+        assertEquals("live-ok", resSource.reason)
+        assertFalse(resSource.isPcdn)
+        assertFalse(resSource.isMcdn)
 
-        // 直播纯 PCDN 标记为 live-pcdn-detected
         val livePcdn = "http://112.34.56.78:8080/live-bvc/123/live.flv?sign=abc"
         val resPcdn = BiliAcceleratorCore.rewriteUrl(livePcdn, defaultConfig)
-        assertFalse("Live PCDN without source should not be arbitrarily rewritten to VOD host", resPcdn.changed)
-        assertEquals("live-pcdn-detected", resPcdn.reason)
-        assertTrue("isPcdn flag should be true", resPcdn.isPcdn)
+        assertFalse("Live PCDN must remain untouched", resPcdn.changed)
+        assertEquals(livePcdn, resPcdn.finalUrl)
+        assertEquals("live-ok", resPcdn.reason)
+        assertFalse(resPcdn.isPcdn)
+        assertFalse(resPcdn.isMcdn)
     }
 
     @Test
-    fun testLiveFilterAndFillBackupUrls() {
+    fun testLiveFilterAndFillBackupUrlsPassThrough() {
         val candidateBackups = listOf(
             "https://d1--cn-gotcha02.bilivideo.com/live-bvc/123/live.flv",
             "http://xy123.szbdyd.com:8080/live-bvc/123/live.flv",
             "https://xy1.mcdn.bilivideo.cn/live-bvc/123/live.flv"
         )
-        val filtered = BiliAcceleratorCore.filterAndFillBackupUrls(candidateBackups, defaultConfig)
-        assertEquals(1, filtered.size)
-        assertEquals("https://d1--cn-gotcha02.bilivideo.com/live-bvc/123/live.flv", filtered[0])
+        var rewriteCallbacks = 0
+        val filtered = BiliAcceleratorCore.filterAndFillBackupUrls(candidateBackups, defaultConfig) {
+            rewriteCallbacks++
+        }
+        assertEquals(candidateBackups, filtered)
+        assertEquals(0, rewriteCallbacks)
     }
 
     @Test

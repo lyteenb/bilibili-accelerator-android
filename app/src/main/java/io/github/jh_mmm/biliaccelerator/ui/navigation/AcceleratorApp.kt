@@ -33,6 +33,7 @@ fun AcceleratorApp(
     onUiPreferencesChange: (UiPreferences) -> Unit,
     onClearStats: () -> Unit,
     onExportDiagnostic: () -> Unit,
+    onDownloadDebugReport: () -> Unit,
     onRefresh: () -> Unit,
     onLogClick: (RewriteLogEntry) -> Unit,
     uposEntries: List<String>,
@@ -69,6 +70,7 @@ fun AcceleratorApp(
                         onUiPreferencesChange = onUiPreferencesChange,
                         onClearStats = onClearStats,
                         onExportDiagnostic = onExportDiagnostic,
+                        onDownloadDebugReport = onDownloadDebugReport,
                         uposEntries = uposEntries,
                         uposValues = uposValues,
                         bottomContentPadding = 88.dp

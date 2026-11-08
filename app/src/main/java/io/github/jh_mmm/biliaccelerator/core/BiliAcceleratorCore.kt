@@ -41,7 +41,8 @@ data class AcceleratorConfig(
     val btrAutoChunkSize: Boolean = true,
     val btrChunkSizeKb: Int = 512,
     val customCdnPool: List<String> = emptyList(),
-    val btrCdnPoolSize: Int = 8
+    val btrCdnPoolSize: Int = 8,
+    val enableDebugLogging: Boolean = false
 )
 
 object BiliAcceleratorCore {
@@ -183,6 +184,34 @@ object BiliAcceleratorCore {
         if (!h.contains("::") && groups.size != 8) return false
         val nonEmptyGroups = groups.filter { it.isNotEmpty() }
         return nonEmptyGroups.isNotEmpty() && nonEmptyGroups.all { IPV6_GROUP_REGEX.matches(it) }
+    }
+
+    fun isLoopbackHost(raw: String): Boolean {
+        val value = cleanHost(raw)
+        if (value.isBlank()) return false
+        val unwrapped = value.removePrefix("[").substringBefore(']')
+        val hostPart = if (unwrapped == value && value.count { it == ':' } == 1) {
+            value.substringBefore(':')
+        } else {
+            unwrapped
+        }.lowercase()
+        val ipv4Parts = hostPart.split('.')
+        val isLoopbackIpv4 = ipv4Parts.size == 4 &&
+                ipv4Parts[0] == "127" &&
+                ipv4Parts.all { part ->
+                    part.isNotEmpty() &&
+                        part.all { it.isDigit() } &&
+                        part.toIntOrNull()?.let { it in 0..255 } == true
+                }
+        return hostPart == "localhost" ||
+                hostPart == "::1" ||
+                isLoopbackIpv4
+    }
+
+    fun formatHostForDisplay(raw: String): String {
+        val value = cleanHost(raw)
+        if (value.isBlank()) return ""
+        return if (isLoopbackHost(value)) "本地代理 ($value)" else value
     }
 
     fun cleanHost(raw: String?): String {
@@ -524,6 +553,14 @@ object BiliAcceleratorCore {
         }
 
         val isLive = isLiveMediaUrl(parsed.path, original)
+
+        // Live streams are passed through unchanged. Their paths and
+        // signatures may be bound to the original CDN or a local proxy, so
+        // filtering or authority substitution can make playback fail.
+        if (isLive) {
+            return noChange(original, "live-ok", isPcdn = false, isMcdn = false, segmentKey = segKey)
+        }
+
         val port = parsed.port
         val isBiliFamily = isBiliFamilyHost(hostname)
         val hasBiliMediaSignature = parsed.path.contains("/upgcxcode/") ||
@@ -535,11 +572,11 @@ object BiliAcceleratorCore {
         val hasNonDefaultPort = config.portHeuristic && port != -1 && port != 80 && port != 443
         val queryMcdn = parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
         val isMcdn = isMcdnHost(hostname) || queryMcdn
-        val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname) || isLive)) ||
+        val isPcdn = (isIp && (hasBiliMediaSignature || isKnownP2pHost(hostname))) ||
                 isKnownP2pHost(hostname) ||
-                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature || isLive))
+                (hasNonDefaultPort && (isBiliFamily || hasBiliMediaSignature))
 
-        // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名（点播与直播通用）
+        // 1. szbdyd / mountaintoys 调度器：直接恢复 xy_usource 参数所携带的真实原生 CDN 域名
         val isScheduler = hostname.endsWith(".szbdyd.com", ignoreCase = true) ||
                 hostname.endsWith(".mountaintoys.cn", ignoreCase = true)
         if (isScheduler) {
@@ -549,7 +586,6 @@ object BiliAcceleratorCore {
             if (isValidHost(cleanedSource) && isBiliCdnHost(hostOnly)) {
                 val rewritten = parsed.replaceAuthority(hostOnly)
                 val baseReason = if (hostname.endsWith(".mountaintoys.cn", ignoreCase = true)) "mountaintoys-source" else "szbdyd-source"
-                val reason = if (isLive) "live-$baseReason" else baseReason
                 if (rewritten != original) {
                     return RewriteResult(
                         changed = true,
@@ -557,7 +593,7 @@ object BiliAcceleratorCore {
                         finalUrl = rewritten,
                         originalHost = hostname,
                         targetHost = hostOnly,
-                        reason = reason,
+                        reason = baseReason,
                         isPcdn = true,
                         isMcdn = false,
                         segmentKey = segKey
@@ -565,15 +601,6 @@ object BiliAcceleratorCore {
                 } else {
                     return noChange(original, "ok", isPcdn = true, segmentKey = segKey)
                 }
-            }
-        }
-
-        // 直播流 PCDN/MCDN 检测：若非 szbdyd/mountaintoys 还原，标记其为直播 PCDN，绝不盲目改写至 VOD UPOS 镜像
-        if (isLive) {
-            return if (isPcdn || isMcdn) {
-                noChange(original, "live-pcdn-detected", isPcdn = true, isMcdn = isMcdn, segmentKey = segKey)
-            } else {
-                noChange(original, "live-ok", isPcdn = false, isMcdn = false, segmentKey = segKey)
             }
         }
 
@@ -684,27 +711,15 @@ object BiliAcceleratorCore {
         onRewrite: ((RewriteResult) -> Unit)? = null
     ): List<String> {
         if (!config.enabled) return rawList.distinct()
-        val isLiveList = rawList.any { isLiveMediaUrl("", it) }
+        // Live candidates are passed through unchanged. Filtering live
+        // backups can remove the only URL that still has a valid signature.
+        if (rawList.any { isLiveMediaUrl("", it) }) {
+            return rawList.distinct()
+        }
+
         val target = config.targetHost
         val filtered = mutableListOf<String>()
         var hasCleanOfficial = false
-
-        if (isLiveList) {
-            // 直播流候选过滤：
-            // 1. 若带 xy_usource 则恢复为官方源站
-            // 2. 剥离 PCDN / MCDN / 高位端口 / 裸 IP 节点，保留原生官方 CDN (gotcha / live-bvc 等)
-            for (url in rawList) {
-                val res = rewriteUrl(url, config)
-                if (res.changed) {
-                    onRewrite?.invoke(res)
-                    filtered.add(res.finalUrl)
-                } else if (!res.isPcdn && !res.isMcdn) {
-                    filtered.add(url)
-                }
-            }
-            // 容错兜底：若所有节点均被判定为 PCDN（极端情况），保留原列表避免直播黑屏
-            return if (filtered.isNotEmpty()) filtered.distinct() else rawList.distinct()
-        }
 
         // VOD 点播流候选过滤与补全
         for (url in rawList) {

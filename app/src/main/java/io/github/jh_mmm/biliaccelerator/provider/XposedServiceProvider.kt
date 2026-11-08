@@ -204,6 +204,11 @@ class XposedServiceProvider : ContentProvider() {
             }
         }
 
+        @VisibleForTesting
+        internal fun isScopeQuerySourceCurrent(binder: IBinder): Boolean {
+            return rawIsBound && serviceBinder === binder && binder.isBinderAlive
+        }
+
         fun triggerScopeQueryAsync(binder: IBinder? = serviceBinder, force: Boolean = false) {
             val targetBinder = binder ?: serviceBinder ?: return
             if (!targetBinder.isBinderAlive) return
@@ -217,10 +222,28 @@ class XposedServiceProvider : ContentProvider() {
             scopeExecutor.execute {
                 try {
                     val scope = queryFrameworkScope(targetBinder)
-                    if (scope != null) {
-                        safeInfo("Queried framework scope: $scope")
-                        io.github.jh_mmm.biliaccelerator.core.StatsManager.recordFrameworkScope(scope)
+                    if (scope == null) {
+                        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                            "FRAMEWORK",
+                            "scope query returned null"
+                        )
+                        return@execute
                     }
+                    // Discard results from a binder that has since died or been
+                    // replaced, otherwise an old async query can restore stale scope.
+                    if (!isScopeQuerySourceCurrent(targetBinder)) {
+                        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                            "FRAMEWORK",
+                            "stale scope query result discarded"
+                        )
+                        return@execute
+                    }
+                    safeInfo("Queried framework scope: $scope")
+                    io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                        "FRAMEWORK",
+                        "scope query succeeded count=${scope.size}"
+                    )
+                    io.github.jh_mmm.biliaccelerator.core.StatsManager.recordFrameworkScope(scope)
                 } catch (t: Throwable) {
                     safeWarn("Async scope query exception: ${t.message}")
                 }
@@ -233,7 +256,8 @@ class XposedServiceProvider : ContentProvider() {
                     rawIsBound = false
                     serviceBinder = null
                     deathRecipient = null
-                    io.github.jh_mmm.biliaccelerator.core.StatsManager.clearFrameworkScope()
+                    io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record("FRAMEWORK", "XposedService binder died")
+                    io.github.jh_mmm.biliaccelerator.core.StatsManager.invalidateFrameworkRuntimeState()
                 }
             }
         }
@@ -260,7 +284,7 @@ class XposedServiceProvider : ContentProvider() {
                 if (scope != null) {
                     io.github.jh_mmm.biliaccelerator.core.StatsManager.recordFrameworkScope(scope)
                 } else if (!bound) {
-                    io.github.jh_mmm.biliaccelerator.core.StatsManager.clearFrameworkScope()
+                    io.github.jh_mmm.biliaccelerator.core.StatsManager.invalidateFrameworkRuntimeState()
                 }
             }
         }
@@ -317,6 +341,10 @@ class XposedServiceProvider : ContentProvider() {
                     return Bundle().apply { putBoolean("result", true) }
                 }
                 // 已有存活的框架 Binder 绑定时拒绝被其他调用顶替，防止状态假阳性劫持
+                io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                    "FRAMEWORK",
+                    "ignored binder replacement uid=$uid"
+                )
                 safeWarn("Ignored binder replacement while existing XposedService binder is alive (uid=$uid)")
                 return null
             }
@@ -326,6 +354,9 @@ class XposedServiceProvider : ContentProvider() {
             if (current != null && oldRecipient != null) {
                 runCatching { current.unlinkToDeath(oldRecipient, 0) }
             }
+            // A replacement binder is a new framework session. Never let
+            // heartbeat/rewrite evidence from the previous binding leak in.
+            io.github.jh_mmm.biliaccelerator.core.StatsManager.invalidateFrameworkRuntimeState()
 
             val recipient = IBinder.DeathRecipient {
                 safeWarn("Framework XposedService Binder died")
@@ -337,6 +368,10 @@ class XposedServiceProvider : ContentProvider() {
                 serviceBinder = binder
                 deathRecipient = recipient
                 rawIsBound = true
+                io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                    "FRAMEWORK",
+                    "XposedService binder bound uid=$uid"
+                )
                 safeInfo("Successfully bound framework XposedService Binder from uid=$uid")
             } catch (t: Throwable) {
                 safeWarn("Failed to linkToDeath on binder: ${t.message}")

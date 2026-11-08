@@ -18,9 +18,6 @@ object PlayerHook {
         internal set
 
     private val builderPendingBackups = Collections.synchronizedMap(WeakHashMap<Any, List<String>>())
-    private val builderCleanLiveHost = Collections.synchronizedMap(WeakHashMap<Any, String>())
-    @Volatile
-    private var latestCleanLiveHost: String? = null
 
     // Both spellings are observed across different Bilibili versions (Assert vs Asset)
     private val SEGMENT_BUILDER_CLASSES = listOf(
@@ -114,6 +111,20 @@ object PlayerHook {
                         return@intercept chain.proceed()
                     }
 
+                    // Live backup lists must never enter BTR session storage or
+                    // candidate propagation. A live FLV/HLS URL must not replace
+                    // the backups of the most recent VOD BTR session.
+                    val isLiveBackupList = rawList.any {
+                        BiliAcceleratorCore.isLiveMediaUrl("", it)
+                    }
+                    if (isLiveBackupList) {
+                        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                            "LIVE",
+                            "backup passthrough count=${rawList.size} btrUpdateSkipped=true"
+                        )
+                        return@intercept chain.proceed()
+                    }
+
                     val distinctFiltered = if (config.blockPcdn || config.proxyMcdn || config.forceUpos) {
                         filterAndFillBackupUrls(rawList, config) { res ->
                             RemoteClient.notifyRewrite(res)
@@ -124,19 +135,6 @@ object PlayerHook {
 
                     chain.thisObject?.let { builder ->
                         builderPendingBackups[builder] = distinctFiltered
-                        val cleanLive = distinctFiltered.firstOrNull {
-                            val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(it)?.host)
-                            BiliAcceleratorCore.isLiveMediaUrl("", it) &&
-                                    !BiliAcceleratorCore.isKnownP2pHost(host) &&
-                                    !BiliAcceleratorCore.isIpAddress(host)
-                        }
-                        if (cleanLive != null) {
-                            val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanLive)?.host)
-                            if (host.isNotBlank()) {
-                                builderCleanLiveHost[builder] = host
-                                latestCleanLiveHost = host
-                            }
-                        }
                     }
 
                     if (config.enableBtr && io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
@@ -243,33 +241,6 @@ object PlayerHook {
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, config)
 
         if (isLive) {
-            if (result.changed) {
-                RemoteClient.notifyRewrite(result)
-                val newArgs = args.toTypedArray()
-                newArgs[strIndex] = result.finalUrl
-                return newArgs
-            }
-            if (result.isPcdn && config.blockPcdn) {
-                val cleanLiveHost = builderInstance?.let { builderCleanLiveHost[it] } ?: latestCleanLiveHost
-                if (!cleanLiveHost.isNullOrBlank() && !BiliAcceleratorCore.isKnownP2pHost(cleanLiveHost) && !BiliAcceleratorCore.isIpAddress(cleanLiveHost)) {
-                    val rewritten = parsed.replaceAuthority(cleanLiveHost)
-                    val liveResult = RewriteResult(
-                        changed = true,
-                        originalUrl = originalUrl,
-                        finalUrl = rewritten,
-                        originalHost = parsed.host,
-                        targetHost = cleanLiveHost,
-                        reason = "live-pcdn-filter",
-                        isPcdn = true,
-                        isMcdn = result.isMcdn,
-                        segmentKey = result.segmentKey
-                    )
-                    RemoteClient.notifyRewrite(liveResult)
-                    val newArgs = args.toTypedArray()
-                    newArgs[strIndex] = rewritten
-                    return newArgs
-                }
-            }
             RemoteClient.notifyRewrite(result)
             return null
         }

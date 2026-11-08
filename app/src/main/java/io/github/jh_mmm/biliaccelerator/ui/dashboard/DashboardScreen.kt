@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.jh_mmm.biliaccelerator.R
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.RewriteLogEntry
 import io.github.jh_mmm.biliaccelerator.core.StatsSnapshot
 import io.github.jh_mmm.biliaccelerator.ui.MainActivity
@@ -228,38 +229,46 @@ private fun RuntimeStatusCard(
     val containerColor = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> if (dark) Color(0xFF143320) else Color(0xFFE2F8E7)
         ActivationState.ACTIVE_HEARTBEAT -> if (dark) Color(0xFF112938) else Color(0xFFE1F4FD)
+        ActivationState.FRAMEWORK_READY -> if (dark) Color(0xFF3A2D12) else Color(0xFFFFF4D6)
         ActivationState.INACTIVE -> if (dark) Color(0xFF381818) else Color(0xFFFAECEC)
     }
 
     val accentColor = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> Color(0xFF2ECC71)
         ActivationState.ACTIVE_HEARTBEAT -> Color(0xFF00AEEC)
+        ActivationState.FRAMEWORK_READY -> Color(0xFFF0A500)
         ActivationState.INACTIVE -> Color(0xFFF72727)
     }
 
     val title = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> "运行正常"
         ActivationState.ACTIVE_HEARTBEAT -> "等待拦截"
+        ActivationState.FRAMEWORK_READY -> "框架已连接"
         ActivationState.INACTIVE -> "模块未激活"
     }
 
     val now = System.currentTimeMillis()
-    val hasRecentHeartbeat = snapshot.lastHeartbeatTimestamp > 0L &&
+    val hasRecentHeartbeat = snapshot.hasRuntimeHeartbeat &&
+            snapshot.lastHeartbeatTimestamp > 0L &&
             (now - snapshot.lastHeartbeatTimestamp) in 0..MainActivity.DEFAULT_HEARTBEAT_THRESHOLD_MS
+    val hasFreshScope = MainActivity.isScopeQueryFresh(snapshot.scopeQueriedAt, now)
 
     val summary = when (state) {
         ActivationState.ACTIVE_EFFECTIVE -> "视频流原生加速与 PCDN 过滤已生效"
-        ActivationState.ACTIVE_HEARTBEAT -> if (hasRecentHeartbeat && !snapshot.clientPackage.isNullOrEmpty()) {
-            "已连接 ${snapshot.clientPackage} · 播放视频即可加速"
-        } else if (!snapshot.clientPackage.isNullOrEmpty()) {
-            "已连接 ${snapshot.clientPackage} · 处于等待拦截状态"
+        ActivationState.ACTIVE_HEARTBEAT -> if (!snapshot.clientPackage.isNullOrEmpty()) {
+            "当前会话已连接 ${snapshot.clientPackage} · 播放视频即可加速"
         } else {
-            "LSPosed 模块就绪 · 处于等待拦截状态"
+            "已收到当前会话心跳 · 播放视频即可加速"
         }
-        ActivationState.INACTIVE -> if (snapshot.hasQueriedScope && !snapshot.hasTargetScope) {
-            "模块已连接 · 但作用域未勾选哔哩哔哩"
-        } else {
-            "未检测到框架激活或通信，点击查看排查指引"
+        ActivationState.FRAMEWORK_READY ->
+            "LSPosed Service 与作用域已连接，但尚未收到当前 B站会话心跳，无法确认模块开关已真正生效"
+        ActivationState.INACTIVE -> when {
+            snapshot.hasQueriedScope && hasFreshScope && !snapshot.hasTargetScope ->
+                "模块已连接 · 但作用域未勾选哔哩哔哩"
+            snapshot.hasQueriedScope && !hasFreshScope ->
+                "框架作用域确认已过期，正在重新检查"
+            else ->
+                "未检测到框架激活或通信，点击查看排查指引"
         }
     }
 
@@ -287,6 +296,7 @@ private fun RuntimeStatusCard(
                     imageVector = when (state) {
                         ActivationState.ACTIVE_EFFECTIVE -> Icons.Rounded.CheckCircleOutline
                         ActivationState.ACTIVE_HEARTBEAT -> Icons.Outlined.Check
+                        ActivationState.FRAMEWORK_READY -> Icons.Default.Warning
                         ActivationState.INACTIVE -> Icons.Default.Warning
                     },
                     contentDescription = null,
@@ -322,6 +332,7 @@ private fun RuntimeStatusCard(
                             text = when (state) {
                                 ActivationState.ACTIVE_EFFECTIVE -> stringResource(R.string.status_badge_in_effect)
                                 ActivationState.ACTIVE_HEARTBEAT -> stringResource(R.string.status_badge_active)
+                                ActivationState.FRAMEWORK_READY -> stringResource(R.string.status_badge_ready)
                                 ActivationState.INACTIVE -> stringResource(R.string.status_badge_inactive)
                             },
                             fontSize = 11.sp,
@@ -587,6 +598,7 @@ private fun RewriteLogCard(
         log.reason.contains("熔断") || log.reason.contains("failover") -> "BTR 熔断" to TagBtrFailover
         log.isBtr || log.reason.contains("BTR") -> "BTR 并发" to TagBtr
         log.reason.contains("moss") -> "Moss 优化" to TagMoss
+        log.reason == "live-pcdn-filter" -> "直播线路替换" to TagSched
         log.reason.contains("live") -> "直播优化" to TagSched
         log.reason.contains("akamai") -> "Akamai" to TagUpos
         log.reason.contains("source") -> "线路调度" to TagSched
@@ -643,12 +655,12 @@ private fun RewriteLogCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "原域名: ",
+                    text = if (BiliAcceleratorCore.isLoopbackHost(log.originalHost)) "来源: " else "原域名: ",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    text = log.originalHost,
+                    text = BiliAcceleratorCore.formatHostForDisplay(log.originalHost),
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Medium,

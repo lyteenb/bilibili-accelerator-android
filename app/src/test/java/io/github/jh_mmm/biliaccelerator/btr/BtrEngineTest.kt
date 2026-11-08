@@ -59,6 +59,53 @@ class BtrEngineTest {
     }
 
     @Test
+    fun testLiveBackupsCannotPolluteVodSession() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/77/88/live-isolation-vod.m4s"
+        val officialBackups = listOf(
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/77/88/live-isolation-vod.m4s"
+        )
+        val sessionId = BtrSessionManager.register(primary, officialBackups)
+        assertEquals(officialBackups, BtrSessionManager.get(sessionId)?.backupUrls)
+
+        BtrSessionManager.updateBackups(
+            sessionId,
+            listOf("https://d1--cn-gotcha204b.bilivideo.com/live-bvc/123/live.flv")
+        )
+        assertEquals(
+            "Direct live backup update must be rejected",
+            officialBackups,
+            BtrSessionManager.get(sessionId)?.backupUrls
+        )
+
+        BtrSessionManager.updateBackupsByCandidateUrls(
+            listOf("https://d1--cn-gotcha209b.bilivideo.com/live-bvc/123/live.flv")
+        )
+        assertEquals(
+            "Unbound live backup list must not replace latest VOD session",
+            officialBackups,
+            BtrSessionManager.get(sessionId)?.backupUrls
+        )
+    }
+
+    @Test
+    fun testUnmatchedVodBackupsDoNotFallbackToLatestSession() {
+        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/91/92/unmatched-latest-test.m4s"
+        val officialBackups = listOf(
+            "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/91/92/unmatched-latest-test.m4s"
+        )
+        val sessionId = BtrSessionManager.register(primary, officialBackups)
+
+        BtrSessionManager.updateBackupsByCandidateUrls(
+            listOf("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/88/unrelated.m4s")
+        )
+        assertEquals(
+            "Unmatched path must not overwrite the latest BTR session",
+            officialBackups,
+            BtrSessionManager.get(sessionId)?.backupUrls
+        )
+    }
+
+    @Test
     fun testSynthesizeCompatibleBackupsForOverseasAkamai() {
         val akamaiPrimary = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/12345.m4s?deadline=1700000000"
         val backups = BtrSessionManager.synthesizeCompatibleBackups(akamaiPrimary)
