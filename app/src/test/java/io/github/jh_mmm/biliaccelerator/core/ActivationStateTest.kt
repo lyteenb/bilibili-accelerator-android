@@ -24,6 +24,7 @@ class ActivationStateTest {
             totalRewrites = 20,
             pcdnBlocked = 10,
             mcdnProxied = 5,
+            safeFallbackCount = 2,
             avoidedHosts = listOf("pcdn.sz.bili.com"),
             recentLogs = emptyList(),
             installedAt = "2026-10-07 18:00:00",
@@ -38,6 +39,7 @@ class ActivationStateTest {
 
         assertEquals(snapshot.totalRequests, deserialized.totalRequests)
         assertEquals(snapshot.totalRewrites, deserialized.totalRewrites)
+        assertEquals(snapshot.safeFallbackCount, deserialized.safeFallbackCount)
         assertEquals(snapshot.lastHeartbeatTimestamp, deserialized.lastHeartbeatTimestamp)
         assertEquals(snapshot.lastRewriteTimestamp, deserialized.lastRewriteTimestamp)
         assertTrue(deserialized.isFrameworkActivated)

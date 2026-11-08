@@ -420,6 +420,23 @@ private fun RuntimeStatsGrid(snapshot: StatsSnapshot) {
                 modifier = Modifier.weight(1f)
             )
         }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            StatCard(
+                value = snapshot.safeFallbackCount.toString(),
+                label = "安全回退次数",
+                valueColor = TagUpos,
+                modifier = Modifier.weight(1f)
+            )
+            StatCard(
+                value = snapshot.btrFailoverCount.toString(),
+                label = "BTR 熔断转移",
+                valueColor = TagBtrFailover,
+                modifier = Modifier.weight(1f)
+            )
+        }
     }
 }
 

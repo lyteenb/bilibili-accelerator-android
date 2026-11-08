@@ -15,6 +15,7 @@ class DebugReportBuilderTest {
             totalRewrites = 167,
             pcdnBlocked = 7,
             mcdnProxied = 42,
+            safeFallbackCount = 3,
             btrTotalChunks = 103,
             btrTotalBytes = 31L * 1024L * 1024L,
             btrFailoverCount = 18,
@@ -123,6 +124,7 @@ class DebugReportBuilderTest {
         assertTrue(report.contains("本次进程收到过心跳: true"))
         assertTrue(report.contains("btrConcurrency=8"))
         assertTrue(report.contains("enableDebugLogging=true"))
+        assertTrue(report.contains("safeFallbackCount=3"))
         assertTrue(report.contains("直播策略: 完全直通"))
         assertTrue(report.contains("PCDN 策略: 仅作用于点播流"))
         assertTrue(report.contains("source=本地代理 (127.0.0.1:34111)"))

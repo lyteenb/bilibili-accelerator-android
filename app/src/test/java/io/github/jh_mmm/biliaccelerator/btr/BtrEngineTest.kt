@@ -351,6 +351,27 @@ class BtrEngineTest {
     }
 
     @Test
+    fun testSafeFallbackStatisticsCounter() {
+        val before = StatsManager.getSnapshot().safeFallbackCount
+        StatsManager.recordRequests(
+            listOf(
+                RewriteResult(
+                    changed = false,
+                    originalUrl = "https://proxy-tf-all-tx.bilivideo.com/?url=https%3A%2F%2Fxy.mcdn.bilivideo.cn%2Fupgcxcode%2F1.m4s",
+                    finalUrl = "https://xy.mcdn.bilivideo.cn/upgcxcode/1.m4s",
+                    originalHost = "proxy-tf-all-tx.bilivideo.com",
+                    targetHost = "xy.mcdn.bilivideo.cn",
+                    reason = BiliAcceleratorCore.SAFE_FALLBACK_REASON,
+                    isPcdn = false,
+                    isMcdn = false,
+                    segmentKey = "safe-fallback-test-${System.nanoTime()}"
+                )
+            )
+        )
+        assertEquals(before + 1L, StatsManager.getSnapshot().safeFallbackCount)
+    }
+
+    @Test
     fun testCalculateDynamicChunkSize() {
         // 音频始终保持 128KB
         assertEquals(128 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(100 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = true))

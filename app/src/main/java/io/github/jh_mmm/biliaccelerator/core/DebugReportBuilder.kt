@@ -194,6 +194,7 @@ object DebugReportBuilder {
         sb.appendLine("rewriteRatio=${if (snapshot.totalRequests > 0L) String.format(Locale.US, "%.2f%%", snapshot.totalRewrites * 100.0 / snapshot.totalRequests) else "n/a"}")
         sb.appendLine("pcdnBlocked=${snapshot.pcdnBlocked}")
         sb.appendLine("mcdnProxied=${snapshot.mcdnProxied}")
+        sb.appendLine("safeFallbackCount=${snapshot.safeFallbackCount}")
         sb.appendLine("btrTotalChunks=${snapshot.btrTotalChunks}")
         sb.appendLine("btrTotalBytes=${snapshot.btrTotalBytes}")
         sb.appendLine("btrAvgBytesPerChunk=${if (snapshot.btrTotalChunks > 0L) snapshot.btrTotalBytes / snapshot.btrTotalChunks else 0L}")

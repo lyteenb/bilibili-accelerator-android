@@ -40,6 +40,7 @@ data class StatsSnapshot(
     val totalRewrites: Long = 0,
     val pcdnBlocked: Long = 0,
     val mcdnProxied: Long = 0,
+    val safeFallbackCount: Long = 0L,
     val btrTotalChunks: Long = 0L,
     val btrTotalBytes: Long = 0L,
     val btrFailoverCount: Long = 0L,
@@ -67,6 +68,7 @@ object StatsManager {
     private const val KEY_TOTAL_REWRITES = "stat_total_rewrites"
     private const val KEY_PCDN_BLOCKED = "stat_pcdn_blocked"
     private const val KEY_MCDN_PROXIED = "stat_mcdn_proxied"
+    private const val KEY_SAFE_FALLBACK_COUNT = "stat_safe_fallback_count"
     private const val KEY_BTR_TOTAL_CHUNKS = "stat_btr_total_chunks"
     private const val KEY_BTR_TOTAL_BYTES = "stat_btr_total_bytes"
     private const val KEY_BTR_FAILOVER_COUNT = "stat_btr_failover_count"
@@ -92,6 +94,7 @@ object StatsManager {
     private val totalRewrites = AtomicLong(0)
     private val pcdnBlocked = AtomicLong(0)
     private val mcdnProxied = AtomicLong(0)
+    private val safeFallbackCount = AtomicLong(0L)
     private val btrTotalChunks = AtomicLong(0L)
     private val btrTotalBytes = AtomicLong(0L)
     private val btrFailoverCount = AtomicLong(0L)
@@ -147,6 +150,7 @@ object StatsManager {
             totalRewrites.set(sp.getLong(KEY_TOTAL_REWRITES, 0))
             pcdnBlocked.set(sp.getLong(KEY_PCDN_BLOCKED, 0))
             mcdnProxied.set(sp.getLong(KEY_MCDN_PROXIED, 0))
+            safeFallbackCount.set(sp.getLong(KEY_SAFE_FALLBACK_COUNT, 0L))
             btrTotalChunks.set(sp.getLong(KEY_BTR_TOTAL_CHUNKS, 0L))
             btrTotalBytes.set(sp.getLong(KEY_BTR_TOTAL_BYTES, 0L))
             btrFailoverCount.set(sp.getLong(KEY_BTR_FAILOVER_COUNT, 0L))
@@ -377,6 +381,9 @@ object StatsManager {
             return
         }
         totalRequests.incrementAndGet()
+        if (result.reason == BiliAcceleratorCore.SAFE_FALLBACK_REASON) {
+            safeFallbackCount.incrementAndGet()
+        }
         DebugEventBuffer.record(
             "ROUTE",
             "changed=${result.changed} reason=${result.reason} source=${BiliAcceleratorCore.formatHostForDisplay(result.originalHost)} " +
@@ -471,6 +478,7 @@ object StatsManager {
                     .putLong(KEY_TOTAL_REWRITES, totalRewrites.get())
                     .putLong(KEY_PCDN_BLOCKED, pcdnBlocked.get())
                     .putLong(KEY_MCDN_PROXIED, mcdnProxied.get())
+                    .putLong(KEY_SAFE_FALLBACK_COUNT, safeFallbackCount.get())
                     .putLong(KEY_BTR_TOTAL_CHUNKS, btrTotalChunks.get())
                     .putLong(KEY_BTR_TOTAL_BYTES, btrTotalBytes.get())
                     .putLong(KEY_BTR_FAILOVER_COUNT, btrFailoverCount.get())
@@ -498,6 +506,7 @@ object StatsManager {
             totalRewrites.set(0)
             pcdnBlocked.set(0)
             mcdnProxied.set(0)
+            safeFallbackCount.set(0L)
             btrTotalChunks.set(0L)
             btrTotalBytes.set(0L)
             btrFailoverCount.set(0L)
@@ -518,6 +527,7 @@ object StatsManager {
                     .putLong(KEY_TOTAL_REWRITES, 0L)
                     .putLong(KEY_PCDN_BLOCKED, 0L)
                     .putLong(KEY_MCDN_PROXIED, 0L)
+                    .putLong(KEY_SAFE_FALLBACK_COUNT, 0L)
                     .putLong(KEY_BTR_TOTAL_CHUNKS, 0L)
                     .putLong(KEY_BTR_TOTAL_BYTES, 0L)
                     .putLong(KEY_BTR_FAILOVER_COUNT, 0L)
@@ -536,6 +546,7 @@ object StatsManager {
             totalRewrites = totalRewrites.get(),
             pcdnBlocked = pcdnBlocked.get(),
             mcdnProxied = mcdnProxied.get(),
+            safeFallbackCount = safeFallbackCount.get(),
             btrTotalChunks = btrTotalChunks.get(),
             btrTotalBytes = btrTotalBytes.get(),
             btrFailoverCount = btrFailoverCount.get(),
@@ -624,6 +635,7 @@ object StatsManager {
         sb.appendLine("累计优化/重定向数: ${snapshot.totalRewrites}")
         sb.appendLine("拦截 PCDN 节点数: ${snapshot.pcdnBlocked}")
         sb.appendLine("MCDN 代理中继数: ${snapshot.mcdnProxied}")
+        sb.appendLine("安全回退次数: ${snapshot.safeFallbackCount}")
         sb.appendLine("BTR 并发拉取分片数: ${snapshot.btrTotalChunks}")
         sb.appendLine("BTR 累计并发流量: ${snapshot.btrTotalBytes / (1024 * 1024)} MB")
         sb.appendLine("BTR 节点熔断转移数: ${snapshot.btrFailoverCount}")

@@ -48,6 +48,7 @@ class StatsReceiver : BroadcastReceiver() {
             "live-pcdn-filter",
             "live-pcdn-detected",
             "live-ok",
+            BiliAcceleratorCore.SAFE_FALLBACK_REASON,
             "akamai-pass",
             "akamai-redirect"
         )

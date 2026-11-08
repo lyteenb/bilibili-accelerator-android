@@ -3,6 +3,7 @@ package io.github.jh_mmm.biliaccelerator.core
 import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -308,6 +309,19 @@ class BiliAcceleratorCoreTest {
         assertEquals("本地代理 (127.0.0.1:34111)", BiliAcceleratorCore.formatHostForDisplay("127.0.0.1:34111"))
         assertEquals("本地代理 (localhost:8080)", BiliAcceleratorCore.formatHostForDisplay("localhost:8080"))
         assertEquals("d1--cn-gotcha204b.bilivideo.com", BiliAcceleratorCore.formatHostForDisplay("d1--cn-gotcha204b.bilivideo.com"))
+    }
+
+    @Test
+    fun testPlaybackSessionKeyAndSafeDirectFallback() {
+        val direct = "https://xy113x207x104x10xy.mcdn.bilivideo.cn/upgcxcode/54/12/43384242545-1-100029.m4s?deadline=1"
+        val wrapped = "https://proxy-tf-all-ws.bilivideo.com/?url=" + java.net.URLEncoder.encode(direct, "UTF-8")
+        assertEquals("43384242545", BiliAcceleratorCore.playbackSessionKey(direct))
+        assertEquals("43384242545", BiliAcceleratorCore.playbackSessionKey(wrapped))
+        assertEquals(direct, BiliAcceleratorCore.safeDirectFallbackUrl(direct))
+        assertEquals(direct, BiliAcceleratorCore.safeDirectFallbackUrl(wrapped))
+        assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("http://xy113x207x104x10xy.mcdn.bilivideo.cn/upgcxcode/1.m4s"))
+        assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://112.34.56.78:8080/upgcxcode/1.m4s"))
+        assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://example.com/upgcxcode/1.m4s"))
     }
 
     @Test

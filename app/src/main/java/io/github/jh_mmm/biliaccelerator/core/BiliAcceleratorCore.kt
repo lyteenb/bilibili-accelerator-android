@@ -47,6 +47,8 @@ data class AcceleratorConfig(
 
 object BiliAcceleratorCore {
 
+    const val SAFE_FALLBACK_REASON = "safe-fallback"
+
     val MODULE_PACKAGE: String = BuildConfig.APPLICATION_ID
 
     val TARGET_PACKAGES = setOf(
@@ -539,6 +541,42 @@ object BiliAcceleratorCore {
         if (path.isBlank()) return ""
         val fileName = path.substringAfterLast('/').trim()
         return fileName.take(96)
+    }
+
+    fun playbackSessionKey(rawUrl: String): String {
+        val outer = parseUri(rawUrl) ?: return ""
+        val embedded = outer.queryParam("url")?.takeIf { it.isNotBlank() }
+        val effective = embedded?.let { parseUri(it) } ?: outer
+        val fileName = effective.path.substringAfterLast('/').trim()
+        if (fileName.isBlank()) return effective.path.take(96)
+        val stem = fileName.substringBefore('?').substringBefore('.')
+        val mediaId = stem.replace(Regex("""-\d+-\d+$"""), "").trim()
+        return (mediaId.ifBlank { stem }).take(96)
+    }
+
+    /**
+     * Returns a direct URL only when every relay is unhealthy and the original
+     * URL is a trusted HTTPS official Bilibili media/CDN URL. PCDN, HTTP,
+     * literal IP and non-official hosts are deliberately rejected.
+     */
+    fun safeDirectFallbackUrl(rawUrl: String): String? {
+        var current = rawUrl
+        repeat(3) {
+            val parsed = parseUri(current) ?: return null
+            val host = cleanHost(parsed.host).lowercase().substringBefore(':')
+            val embedded = parsed.queryParam("url")?.takeIf { it.isNotBlank() }
+            if (host.startsWith("proxy-tf-all-")) {
+                if (embedded == null) return null
+                current = embedded
+                return@repeat
+            }
+            if (parsed.scheme != "https") return null
+            if (isLoopbackHost(host)) return null
+            if (!isOfficialBiliHost(host)) return null
+            if (!hasMediaSignal(current)) return null
+            return current
+        }
+        return null
     }
 
     fun rewriteUrl(original: String, config: AcceleratorConfig): RewriteResult {

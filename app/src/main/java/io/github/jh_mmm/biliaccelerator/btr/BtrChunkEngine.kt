@@ -2,6 +2,7 @@ package io.github.jh_mmm.biliaccelerator.btr
 
 import android.util.Log
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
+import io.github.jh_mmm.biliaccelerator.core.RelayHealthRegistry
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.hook.RemoteClient
 import okhttp3.Call
@@ -818,14 +819,16 @@ object BtrChunkEngine {
         val failures = cdnFailureCounts.compute(host) { _, previous ->
             ((previous ?: 0) + 1).coerceAtMost(8)
         } ?: 1
-        cdnPenalties[host] = System.currentTimeMillis() +
-                calculateAdaptivePenaltyMs(baseDurationMs, failures)
+        val adaptivePenalty = calculateAdaptivePenaltyMs(baseDurationMs, failures)
+        cdnPenalties[host] = System.currentTimeMillis() + adaptivePenalty
+        RelayHealthRegistry.markFailure(host, adaptivePenalty)
     }
 
     private fun markHostHealthy(host: String) {
         if (host.isBlank()) return
         cdnFailureCounts.remove(host)
         cdnPenalties.remove(host)
+        RelayHealthRegistry.markSuccess(host)
     }
 
     private fun penaltyForHttpStatus(code: Int): Long {
