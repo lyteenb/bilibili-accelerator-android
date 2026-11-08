@@ -224,6 +224,69 @@ class BtrEngineTest {
     }
 
     @Test
+    fun testConcurrencyCapsForBurstSteadyAndSingleRelay() {
+        val multi = BtrChunkEngine.calculateConcurrencyCaps(
+            requestedConcurrency = 6,
+            autoConcurrency = true,
+            isAudio = false,
+            isSingleRelay = false,
+            memoryBoundPrefetch = 16
+        )
+        assertEquals(8, multi.burst)
+        assertEquals(6, multi.steady)
+
+        val singleRelay = BtrChunkEngine.calculateConcurrencyCaps(
+            requestedConcurrency = 6,
+            autoConcurrency = true,
+            isAudio = false,
+            isSingleRelay = true,
+            memoryBoundPrefetch = 16
+        )
+        assertEquals(4, singleRelay.burst)
+        assertEquals(4, singleRelay.steady)
+
+        val audio = BtrChunkEngine.calculateConcurrencyCaps(
+            requestedConcurrency = 16,
+            autoConcurrency = true,
+            isAudio = true,
+            isSingleRelay = false,
+            memoryBoundPrefetch = 16
+        )
+        assertEquals(2, audio.burst)
+        assertEquals(2, audio.steady)
+
+        val memoryBound = BtrChunkEngine.calculateConcurrencyCaps(
+            requestedConcurrency = 16,
+            autoConcurrency = true,
+            isAudio = false,
+            isSingleRelay = false,
+            memoryBoundPrefetch = 8
+        )
+        assertEquals(8, memoryBound.burst)
+        assertEquals(8, memoryBound.steady)
+
+        val manual = BtrChunkEngine.calculateConcurrencyCaps(
+            requestedConcurrency = 6,
+            autoConcurrency = false,
+            isAudio = false,
+            isSingleRelay = false,
+            memoryBoundPrefetch = 16
+        )
+        assertEquals(6, manual.burst)
+        assertEquals(6, manual.steady)
+    }
+
+    @Test
+    fun testAdaptivePenaltyBackoffIsBounded() {
+        assertEquals(60_000L, BtrChunkEngine.calculateAdaptivePenaltyMs(60_000L, 1))
+        assertEquals(120_000L, BtrChunkEngine.calculateAdaptivePenaltyMs(60_000L, 2))
+        assertEquals(240_000L, BtrChunkEngine.calculateAdaptivePenaltyMs(60_000L, 3))
+        assertEquals(480_000L, BtrChunkEngine.calculateAdaptivePenaltyMs(60_000L, 4))
+        assertEquals(480_000L, BtrChunkEngine.calculateAdaptivePenaltyMs(60_000L, 8))
+        assertEquals(600_000L, BtrChunkEngine.calculateAdaptivePenaltyMs(120_000L, 8))
+    }
+
+    @Test
     fun testCalculateDynamicChunkSize() {
         // 音频始终保持 128KB
         assertEquals(128 * 1024L, BtrChunkEngine.calculateDynamicChunkSize(100 * 1024 * 1024L, 512, autoChunkSize = true, isAudio = true))

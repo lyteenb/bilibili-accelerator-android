@@ -62,6 +62,27 @@ class BtrHttpSafetyTest {
     }
 
     @Test
+    fun testUpstreamRejectionReasonsAreSpecificAndSafe() {
+        assertNull(BtrHttpSafety.upstreamRejectionReason("https://upos-sz-mirrorcos.bilivideo.com/a.m4s"))
+        assertEquals(
+            "scheme must be https",
+            BtrHttpSafety.upstreamRejectionReason("http://upos-sz-mirrorcos.bilivideo.com/a.m4s")
+        )
+        assertTrue(
+            BtrHttpSafety.upstreamRejectionReason("https://example.com/a.m4s")
+                ?.contains("not an official Bilibili CDN") == true
+        )
+        assertEquals(
+            "embedded credentials are not allowed",
+            BtrHttpSafety.upstreamRejectionReason("https://user:pass@upos-sz-mirrorcos.bilivideo.com/a.m4s")
+        )
+        assertEquals(
+            "host 127.0.0.1 is not an official Bilibili CDN",
+            BtrHttpSafety.upstreamRejectionReason("https://127.0.0.1/a.m4s")
+        )
+    }
+
+    @Test
     fun testBoundedRequestParser() {
         val raw = "GET /stream/abc123.m4s HTTP/1.1\r\n" +
             "User-Agent: Test\r\n" +

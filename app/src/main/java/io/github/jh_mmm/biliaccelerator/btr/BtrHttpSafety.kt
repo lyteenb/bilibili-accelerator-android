@@ -32,20 +32,27 @@ internal object BtrHttpSafety {
      * Bilibili media/CDN domain. Public custom hosts, HTTP URLs and literal
      * private addresses are intentionally not accepted for proxying.
      */
-    fun isAllowedUpstreamUrl(raw: String): Boolean {
-        val url = raw.toHttpUrlOrNull() ?: return false
-        if (url.scheme != "https") return false
-        if (url.username.isNotEmpty() || url.password.isNotEmpty()) return false
+    fun upstreamRejectionReason(raw: String): String? {
+        val url = raw.toHttpUrlOrNull() ?: return "invalid URL"
+        if (url.scheme != "https") return "scheme must be https"
+        if (url.username.isNotEmpty() || url.password.isNotEmpty()) return "embedded credentials are not allowed"
         val host = url.host.trim()
-        if (host.isEmpty()) return false
-        if (!BiliAcceleratorCore.isOfficialBiliHost(host)) return false
+        if (host.isEmpty()) return "empty host"
+        if (!BiliAcceleratorCore.isOfficialBiliHost(host)) return "host $host is not an official Bilibili CDN"
 
         val literal = host.removePrefix("[").removeSuffix("]")
         if (IPV4_LITERAL.matches(literal) || literal.contains(':')) {
-            val address = runCatching { InetAddress.getByName(literal) }.getOrNull() ?: return false
-            if (!PublicAddressPolicy.isPublicAddress(address)) return false
+            val address = runCatching { InetAddress.getByName(literal) }.getOrNull()
+                ?: return "invalid literal address $host"
+            if (!PublicAddressPolicy.isPublicAddress(address)) {
+                return "literal host $host is not public"
+            }
         }
-        return true
+        return null
+    }
+
+    fun isAllowedUpstreamUrl(raw: String): Boolean {
+        return upstreamRejectionReason(raw) == null
     }
 
     /**

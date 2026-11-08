@@ -39,8 +39,9 @@ object BtrHttpClient {
         .dns(SafeDns)
         .addNetworkInterceptor { chain ->
             val request = chain.request()
-            if (!BtrHttpSafety.isAllowedUpstreamUrl(request.url.toString())) {
-                throw IOException("Blocked unsafe upstream URL")
+            val rejection = BtrHttpSafety.upstreamRejectionReason(request.url.toString())
+            if (rejection != null) {
+                throw IOException("Blocked unsafe upstream URL: $rejection")
             }
             chain.proceed(request)
         }
@@ -60,8 +61,9 @@ object BtrHttpClient {
         .dns(SafeDns)
         .addNetworkInterceptor { chain ->
             val request = chain.request()
-            if (!BtrHttpSafety.isAllowedUpstreamUrl(request.url.toString())) {
-                throw IOException("Blocked unsafe upstream URL")
+            val rejection = BtrHttpSafety.upstreamRejectionReason(request.url.toString())
+            if (rejection != null) {
+                throw IOException("Blocked unsafe upstream URL: $rejection")
             }
             chain.proceed(request)
         }
