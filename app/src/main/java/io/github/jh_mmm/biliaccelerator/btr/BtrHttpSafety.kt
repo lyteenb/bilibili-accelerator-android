@@ -22,6 +22,12 @@ internal data class BoundedHttpRequest(
 
 internal class HttpRequestTooLargeException(message: String) : Exception(message)
 
+internal data class BoundedBodyRead(
+    val bytes: ByteArray,
+    val tooLarge: Boolean = false,
+    val failureMessage: String? = null
+)
+
 internal object BtrHttpSafety {
     const val MAX_UPSTREAM_BODY_BYTES = 2 * 1024 * 1024
     private val CONTENT_RANGE_REGEX = Regex("""^bytes\s+(\d+)-(\d+)/(\d+|\*)$""", RegexOption.IGNORE_CASE)
@@ -80,6 +86,44 @@ internal object BtrHttpSafety {
         }
 
         return if (total > maxBytes) null else output.toByteArray()
+    }
+
+    /**
+     * Reads a chunk body while retaining bytes received before EOF or a
+     * transport exception. The caller decides whether a short result is a
+     * valid resumable prefix for the requested range.
+     */
+    internal fun readBodyWithPartial(body: ResponseBody?, maxBytes: Int): BoundedBodyRead? {
+        if (maxBytes < 0 || maxBytes > MAX_UPSTREAM_BODY_BYTES) return null
+        if (body == null) return BoundedBodyRead(ByteArray(0))
+
+        val output = ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+        val buffer = ByteArray(32 * 1024)
+        var total = 0
+        var failureMessage: String? = null
+
+        try {
+            body.byteStream().use { input ->
+                while (total <= maxBytes) {
+                    val wanted = minOf(buffer.size, maxBytes + 1 - total)
+                    if (wanted <= 0) break
+                    val read = input.read(buffer, 0, wanted)
+                    if (read == -1) break
+                    if (read == 0) continue
+                    output.write(buffer, 0, read)
+                    total += read
+                }
+            }
+        } catch (t: Exception) {
+            failureMessage = t.message ?: t.javaClass.simpleName
+        }
+
+        val bytes = output.toByteArray()
+        return if (bytes.size > maxBytes) {
+            BoundedBodyRead(bytes = ByteArray(0), tooLarge = true, failureMessage = failureMessage)
+        } else {
+            BoundedBodyRead(bytes = bytes, failureMessage = failureMessage)
+        }
     }
 
     fun parseContentRange(value: String?): ParsedContentRange? {

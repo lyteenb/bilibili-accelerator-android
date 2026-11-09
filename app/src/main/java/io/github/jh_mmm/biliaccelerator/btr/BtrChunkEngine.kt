@@ -20,6 +20,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
+data class ChunkPrefix(
+    val bytes: ByteArray,
+    val totalLength: Long?,
+    val sourcePath: String
+)
+
+internal sealed interface ChunkPayloadResult {
+    data class Complete(val bytes: ByteArray) : ChunkPayloadResult
+    data class Partial(val bytes: ByteArray, val totalLength: Long?) : ChunkPayloadResult
+    data object Invalid : ChunkPayloadResult
+}
+
 internal enum class BtrDirectPipeResult {
     COMPLETED,
     FAILED_BEFORE_RESPONSE,
@@ -38,6 +50,8 @@ object BtrChunkEngine {
     private const val MAX_PREFETCH_CHUNKS = 16
     private const val MAX_MEMORY_PREFETCH_BYTES = 8 * 1024 * 1024L
     private const val MAX_PENALTY_ENTRIES = 256
+    private const val RESUME_MIN_BYTES = 32 * 1024
+    private const val MAX_RESUME_BYTES = 512 * 1024
     private const val MAX_HOST_PENALTY_MS = 10L * 60 * 1000L
     private const val SINGLE_RELAY_CONCURRENCY_CAP = 4
     private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36 BiliApp/7800300"
@@ -107,7 +121,8 @@ object BtrChunkEngine {
         @Volatile var data: ByteArray? = null,
         @Volatile var isSuccess: Boolean = false,
         @Volatile var isFailed: Boolean = false,
-        @Volatile var errorMessage: String? = null
+        @Volatile var errorMessage: String? = null,
+        @Volatile var resumePrefix: ChunkPrefix? = null
     )
 
     private class StreamStatsTracker(
@@ -846,6 +861,12 @@ object BtrChunkEngine {
         } else {
             sortedUrls
         }
+        val expectedBytes = expectedChunkBytes(task)
+        if (expectedBytes == null) {
+            task.isFailed = true
+            task.errorMessage = "Invalid BTR chunk length"
+            return
+        }
 
         val ua = session.userAgent ?: DEFAULT_USER_AGENT
 
@@ -854,10 +875,12 @@ object BtrChunkEngine {
             val host = extractHostname(url)
             if (isPenalized(host)) continue
 
+            val prefix = resumePrefixFor(task, url)
+            val requestStart = task.startByte + (prefix?.bytes?.size ?: 0)
             val startTime = System.currentTimeMillis()
             val request = Request.Builder()
                 .url(url)
-                .header("Range", "bytes=${task.startByte}-${task.endByte}")
+                .header("Range", "bytes=$requestStart-${task.endByte}")
                 .header("Referer", session.referer)
                 .header("User-Agent", ua)
                 .header("Connection", "keep-alive")
@@ -867,20 +890,7 @@ object BtrChunkEngine {
             try {
                 executeWithTracking(streamCallKey, session.sessionId, okClient.newCall(request)) { response ->
                     val code = response.code
-                    if (code == 200 || code == 206) {
-                        val bytes = readChunkPayload(response, task.startByte, task.endByte)
-                        if (bytes == null) {
-                            penalizeHost(host, 10_000L, markRelayHealth = false, adaptive = false)
-                            reportFailover(host, "分片 Range/长度校验失败", session.sessionId, candidateCount)
-                            return@executeWithTracking
-                        }
-                        val latency = System.currentTimeMillis() - startTime
-                        task.data = bytes
-                        task.isSuccess = true
-                        markHostHealthy(host)
-                        statsTracker.recordChunk(host, bytes.size.toLong(), latency)
-                        return
-                    } else if (code == 403 || code >= 500) {
+                    if (code == 403 || code >= 500) {
                         penalizeHost(
                             host = host,
                             baseDurationMs = penaltyForHttpStatus(code),
@@ -888,6 +898,44 @@ object BtrChunkEngine {
                             adaptive = code >= 500
                         )
                         reportFailover(host, "HTTP $code 熔断", session.sessionId, candidateCount)
+                        return@executeWithTracking
+                    }
+
+                    when (val result = readChunkPayload(response, requestStart, task.endByte, prefix?.totalLength)) {
+                        is ChunkPayloadResult.Complete -> {
+                            val merged = mergeChunkParts(prefix?.bytes, result.bytes, expectedBytes)
+                            if (merged == null) {
+                                penalizeHost(host, 10_000L, markRelayHealth = false, adaptive = false)
+                                reportFailover(host, "分片拼接长度不一致", session.sessionId, candidateCount)
+                                return@executeWithTracking
+                            }
+                            val latency = System.currentTimeMillis() - startTime
+                            task.data = merged
+                            task.isSuccess = true
+                            task.resumePrefix = null
+                            markHostHealthy(host)
+                            statsTracker.recordChunk(host, merged.size.toLong(), latency)
+                            return@executeWithTracking
+                        }
+                        is ChunkPayloadResult.Partial -> {
+                            val partial = mergePartialChunkParts(prefix?.bytes, result.bytes, expectedBytes)
+                            if (partial != null) {
+                                rememberResumePrefix(task, partial, result.totalLength, url, expectedBytes)
+                            }
+                            penalizeHost(host, 10_000L, markRelayHealth = false, adaptive = false)
+                            reportFailover(
+                                host,
+                                "分片正文未完成 (${partial?.size ?: result.bytes.size}/$expectedBytes 字节)",
+                                session.sessionId,
+                                candidateCount
+                            )
+                            return@executeWithTracking
+                        }
+                        ChunkPayloadResult.Invalid -> {
+                            penalizeHost(host, 10_000L, markRelayHealth = false, adaptive = false)
+                            reportFailover(host, "分片 Range/长度校验失败", session.sessionId, candidateCount)
+                            return@executeWithTracking
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -912,7 +960,6 @@ object BtrChunkEngine {
             )
         }
     }
-
     private fun tryDirectFetch(
         task: ChunkTask,
         url: String,
@@ -921,12 +968,15 @@ object BtrChunkEngine {
         streamCallKey: String
     ) {
         if (!BtrHttpSafety.isAllowedUpstreamUrl(url)) return
+        val expectedBytes = expectedChunkBytes(task) ?: return
         val host = extractHostname(url)
+        val prefix = resumePrefixFor(task, url)
+        val requestStart = task.startByte + (prefix?.bytes?.size ?: 0)
         val startTime = System.currentTimeMillis()
         val ua = session.userAgent ?: DEFAULT_USER_AGENT
         val request = Request.Builder()
             .url(url)
-            .header("Range", "bytes=${task.startByte}-${task.endByte}")
+            .header("Range", "bytes=$requestStart-${task.endByte}")
             .header("Referer", session.referer)
             .header("User-Agent", ua)
             .header("Connection", "keep-alive")
@@ -935,39 +985,155 @@ object BtrChunkEngine {
         val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.fallbackClient
         try {
             executeWithTracking(streamCallKey, session.sessionId, okClient.newCall(request)) { response ->
-                val bytes = readChunkPayload(response, task.startByte, task.endByte) ?: return@executeWithTracking
-                task.data = bytes
-                task.isSuccess = true
-                markHostHealthy(host)
-                statsTracker.recordChunk(host, bytes.size.toLong(), System.currentTimeMillis() - startTime)
+                when (val result = readChunkPayload(response, requestStart, task.endByte, prefix?.totalLength)) {
+                    is ChunkPayloadResult.Complete -> {
+                        val merged = mergeChunkParts(prefix?.bytes, result.bytes, expectedBytes)
+                            ?: return@executeWithTracking
+                        task.data = merged
+                        task.isSuccess = true
+                        task.resumePrefix = null
+                        markHostHealthy(host)
+                        statsTracker.recordChunk(host, merged.size.toLong(), System.currentTimeMillis() - startTime)
+                    }
+                    is ChunkPayloadResult.Partial -> {
+                        val partial = mergePartialChunkParts(prefix?.bytes, result.bytes, expectedBytes)
+                        if (partial != null) {
+                            rememberResumePrefix(task, partial, result.totalLength, url, expectedBytes)
+                        }
+                    }
+                    ChunkPayloadResult.Invalid -> Unit
+                }
             }
         } catch (_: Throwable) {
         }
     }
 
-    private fun readChunkPayload(response: Response, start: Long, end: Long): ByteArray? {
+    internal fun readChunkPayload(
+        response: Response,
+        requestStart: Long,
+        taskEnd: Long,
+        expectedTotalLength: Long? = null
+    ): ChunkPayloadResult {
         val code = response.code
-        if (code != 200 && code != 206) return null
-        val expectedBytes = end - start + 1
-        if (expectedBytes <= 0 || expectedBytes > BtrHttpSafety.MAX_UPSTREAM_BODY_BYTES) return null
+        if (code != 200 && code != 206) return ChunkPayloadResult.Invalid
 
-        val contentRange = response.header("Content-Range")
-        if (code == 200 && contentRange == null) {
-            // Small files may legitimately ignore Range. Only accept that
-            // fallback for a request starting at zero and never read past the
-            // declared chunk size.
-            val contentLength = response.body?.contentLength() ?: -1L
-            if (start != 0L || contentLength <= 0L || contentLength > expectedBytes) return null
-            val bytes = BtrHttpSafety.readBodyLimited(response.body, expectedBytes.toInt()) ?: return null
-            return bytes.takeIf { it.size.toLong() == contentLength }
+        val expectedBytes = taskEnd - requestStart + 1
+        if (expectedBytes <= 0 || expectedBytes > BtrHttpSafety.MAX_UPSTREAM_BODY_BYTES) {
+            return ChunkPayloadResult.Invalid
         }
 
-        val range = BtrHttpSafety.parseContentRange(contentRange) ?: return null
-        if (range.start != start || range.end != end) return null
+        val contentRange = response.header("Content-Range")
+        if (code == 200) {
+            if (contentRange != null || requestStart != 0L) return ChunkPayloadResult.Invalid
+            val contentLength = response.body?.contentLength() ?: -1L
+            if (contentLength <= 0L || contentLength > expectedBytes) return ChunkPayloadResult.Invalid
+            val read = BtrHttpSafety.readBodyWithPartial(response.body, expectedBytes.toInt())
+                ?: return ChunkPayloadResult.Invalid
+            if (read.tooLarge || read.bytes.isEmpty()) return ChunkPayloadResult.Invalid
+            if (read.bytes.size.toLong() != contentLength) return ChunkPayloadResult.Invalid
+            return ChunkPayloadResult.Complete(read.bytes)
+        }
+
+        val range = BtrHttpSafety.parseContentRange(contentRange) ?: return ChunkPayloadResult.Invalid
+        if (range.start != requestStart || range.end != taskEnd) return ChunkPayloadResult.Invalid
+        if (expectedTotalLength != null && range.total != expectedTotalLength) {
+            return ChunkPayloadResult.Invalid
+        }
+
         val rangeBytes = range.end - range.start + 1
-        if (rangeBytes <= 0 || rangeBytes > BtrHttpSafety.MAX_UPSTREAM_BODY_BYTES) return null
-        val bytes = BtrHttpSafety.readBodyLimited(response.body, rangeBytes.toInt()) ?: return null
-        return bytes.takeIf { it.size.toLong() == rangeBytes }
+        if (rangeBytes <= 0L || rangeBytes > BtrHttpSafety.MAX_UPSTREAM_BODY_BYTES) {
+            return ChunkPayloadResult.Invalid
+        }
+        val read = BtrHttpSafety.readBodyWithPartial(response.body, rangeBytes.toInt())
+            ?: return ChunkPayloadResult.Invalid
+        if (read.tooLarge || read.bytes.isEmpty()) return ChunkPayloadResult.Invalid
+        return if (read.bytes.size.toLong() == rangeBytes) {
+            ChunkPayloadResult.Complete(read.bytes)
+        } else {
+            ChunkPayloadResult.Partial(read.bytes, range.total)
+        }
+    }
+
+    private fun expectedChunkBytes(task: ChunkTask): Int? {
+        val length = task.endByte - task.startByte + 1
+        if (length <= 0L || length > BtrHttpSafety.MAX_UPSTREAM_BODY_BYTES) return null
+        return length.toInt()
+    }
+
+    private fun mediaPath(url: String): String {
+        if (BiliAcceleratorCore.isRelayUrl(url)) {
+            val embeddedUrl = BiliAcceleratorCore.parseUri(url)?.queryParam("url")
+            return embeddedUrl
+                ?.let { BiliAcceleratorCore.parseUri(it)?.path.orEmpty() }
+                .orEmpty()
+        }
+        return BiliAcceleratorCore.parseUri(url)?.path.orEmpty()
+    }
+
+    internal fun resumePrefixFor(task: ChunkTask, url: String): ChunkPrefix? {
+        val prefix = task.resumePrefix ?: return null
+        val expectedBytes = expectedChunkBytes(task) ?: return null
+        if (prefix.bytes.size < RESUME_MIN_BYTES ||
+            prefix.bytes.size > MAX_RESUME_BYTES ||
+            prefix.bytes.size >= expectedBytes
+        ) {
+            return null
+        }
+        val path = mediaPath(url)
+        if (path.isBlank() || prefix.sourcePath != path) return null
+        return prefix
+    }
+
+    internal fun rememberResumePrefix(
+        task: ChunkTask,
+        bytes: ByteArray,
+        totalLength: Long?,
+        url: String,
+        expectedBytes: Int
+    ) {
+        if (bytes.size < RESUME_MIN_BYTES || bytes.size >= expectedBytes) {
+            return
+        }
+        val retainedBytes = if (bytes.size > MAX_RESUME_BYTES) {
+            bytes.copyOf(MAX_RESUME_BYTES)
+        } else {
+            bytes
+        }
+        val path = mediaPath(url)
+        if (path.isBlank()) return
+
+        val current = task.resumePrefix
+        if (current != null) {
+            if (current.sourcePath != path) return
+            if (current.bytes.size >= retainedBytes.size) return
+            if (current.totalLength != null && totalLength == null) return
+            if (current.totalLength != null && totalLength != null && current.totalLength != totalLength) return
+        }
+        task.resumePrefix = ChunkPrefix(bytes = retainedBytes, totalLength = totalLength, sourcePath = path)
+    }
+
+    internal fun mergeChunkParts(prefix: ByteArray?, tail: ByteArray, expectedBytes: Int): ByteArray? {
+        if (expectedBytes <= 0 || tail.size > expectedBytes) return null
+        if (prefix == null) return tail.takeIf { it.size == expectedBytes }
+        if (prefix.size >= expectedBytes) return null
+        if (prefix.size + tail.size != expectedBytes) return null
+        return ByteArray(expectedBytes).also { merged ->
+            System.arraycopy(prefix, 0, merged, 0, prefix.size)
+            System.arraycopy(tail, 0, merged, prefix.size, tail.size)
+        }
+    }
+
+    private fun mergePartialChunkParts(prefix: ByteArray?, tail: ByteArray, expectedBytes: Int): ByteArray? {
+        if (expectedBytes <= 0 || tail.size > expectedBytes) return null
+        val prefixSize = prefix?.size ?: 0
+        val total = prefixSize + tail.size
+        if (total <= 0 || total > expectedBytes) return null
+        if (prefix == null) return tail
+        if (tail.isEmpty()) return prefix
+        return ByteArray(total).also { merged ->
+            System.arraycopy(prefix, 0, merged, 0, prefix.size)
+            System.arraycopy(tail, 0, merged, prefix.size, tail.size)
+        }
     }
 
     private fun rejectRange(

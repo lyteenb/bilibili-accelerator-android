@@ -38,6 +38,21 @@ class BtrHttpSafetyTest {
     }
 
     @Test
+    fun testBoundedBodyReadRetainsPartialPayload() {
+        val result = BtrHttpSafety.readBodyWithPartial("12345".toResponseBody(), 10)
+        assertNotNull(result)
+        assertEquals(5, result?.bytes?.size)
+        assertFalse("A short body is a resumable prefix, not an oversize response", result?.tooLarge ?: true)
+    }
+
+    @Test
+    fun testBoundedBodyReadFlagsOversizedPayload() {
+        val result = BtrHttpSafety.readBodyWithPartial("123456".toResponseBody(), 5)
+        assertNotNull(result)
+        assertTrue("An oversize body must not be retained as a prefix", result?.tooLarge == true)
+    }
+
+    @Test
     fun testPublicAddressPolicyBlocksLocalAndPrivateRanges() {
         for (value in listOf("127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1")) {
             assertFalse(value, PublicAddressPolicy.isPublicAddress(InetAddress.getByName(value)))

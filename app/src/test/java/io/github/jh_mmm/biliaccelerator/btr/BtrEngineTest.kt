@@ -6,12 +6,16 @@ import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Timeout
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -561,6 +565,164 @@ class BtrEngineTest {
         session?.armNativeDirectFallback(now = now, durationMs = 45_000L)
         assertTrue("Native fallback should be active during cooldown", session?.isNativeDirectFallbackActive(now + 1_000L) == true)
         assertFalse("Native fallback must expire so BTR can be retried", session?.isNativeDirectFallbackActive(now + 46_000L) == true)
+    }
+
+    @Test
+    fun testReadChunkPayloadRetainsPartial206Body() {
+        val request = Request.Builder()
+            .url("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s")
+            .build()
+        val response = Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(206)
+            .message("Partial Content")
+            .header("Content-Range", "bytes 0-9/20")
+            .body("12345".toResponseBody())
+            .build()
+
+        val result = BtrChunkEngine.readChunkPayload(response, requestStart = 0L, taskEnd = 9L)
+        assertTrue(result is ChunkPayloadResult.Partial)
+        assertEquals(5, (result as ChunkPayloadResult.Partial).bytes.size)
+        assertEquals(20L, result.totalLength)
+    }
+
+    @Test
+    fun testReadChunkPayloadAcceptsResumedTail() {
+        val request = Request.Builder()
+            .url("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s")
+            .build()
+        val response = Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(206)
+            .message("Partial Content")
+            .header("Content-Range", "bytes 5-9/20")
+            .body("67890".toResponseBody())
+            .build()
+
+        val result = BtrChunkEngine.readChunkPayload(response, requestStart = 5L, taskEnd = 9L, expectedTotalLength = 20L)
+        assertTrue(result is ChunkPayloadResult.Complete)
+        assertEquals("67890", String((result as ChunkPayloadResult.Complete).bytes))
+    }
+
+    @Test
+    fun testReadChunkPayloadRejects200WhenResuming() {
+        val request = Request.Builder()
+            .url("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s")
+            .build()
+        val response = Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .body("67890".toResponseBody())
+            .build()
+
+        val result = BtrChunkEngine.readChunkPayload(response, requestStart = 5L, taskEnd = 9L)
+        assertTrue(result is ChunkPayloadResult.Invalid)
+    }
+
+    @Test
+    fun testReadChunkPayloadRejectsResumeTotalMismatch() {
+        val request = Request.Builder()
+            .url("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s")
+            .build()
+        val response = Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(206)
+            .message("Partial Content")
+            .header("Content-Range", "bytes 5-9/21")
+            .body("67890".toResponseBody())
+            .build()
+
+        val result = BtrChunkEngine.readChunkPayload(response, requestStart = 5L, taskEnd = 9L, expectedTotalLength = 20L)
+        assertTrue(result is ChunkPayloadResult.Invalid)
+    }
+
+    @Test
+    fun testMergeChunkPartsPreservesPrefixOrder() {
+        val prefix = byteArrayOf(1, 2, 3)
+        val tail = byteArrayOf(4, 5)
+        val merged = BtrChunkEngine.mergeChunkParts(prefix, tail, 5)
+        assertNotNull(merged)
+        assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5), merged)
+    }
+
+    @Test
+    fun testMergeChunkPartsRejectsWrongLength() {
+        assertNull(BtrChunkEngine.mergeChunkParts(byteArrayOf(1), byteArrayOf(2, 3), 4))
+    }
+
+    @Test
+    fun testResumePrefixRequiresSameMediaPathAndMinimumSize() {
+        val task = BtrChunkEngine.ChunkTask(
+            index = 0,
+            startByte = 0,
+            endByte = (1024 * 1024 - 1).toLong()
+        )
+        val mediaPath = "/upgcxcode/54/12/resume-test.m4s"
+        task.resumePrefix = ChunkPrefix(
+            bytes = ByteArray(32 * 1024) { 1 },
+            totalLength = 2 * 1024 * 1024L,
+            sourcePath = mediaPath
+        )
+
+        assertNotNull(BtrChunkEngine.resumePrefixFor(task, "https://upos-sz-mirrorcos.bilivideo.com$mediaPath"))
+        assertNull(BtrChunkEngine.resumePrefixFor(task, "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/other.m4s"))
+
+        task.resumePrefix = ChunkPrefix(
+            bytes = ByteArray(1024) { 1 },
+            totalLength = 2 * 1024 * 1024L,
+            sourcePath = mediaPath
+        )
+        assertNull(BtrChunkEngine.resumePrefixFor(task, "https://upos-sz-mirrorcos.bilivideo.com$mediaPath"))
+    }
+
+    @Test
+    fun testResumePrefixUsesEmbeddedRelayMediaPath() {
+        val task = BtrChunkEngine.ChunkTask(
+            index = 0,
+            startByte = 0,
+            endByte = (1024 * 1024 - 1).toLong()
+        )
+        val firstRelay = "https://proxy-tf-all-ws.bilivideo.com/?url=https%3A%2F%2Fupos-sz-mirrorcos.bilivideo.com%2Fupgcxcode%2F54%2F12%2Fresume-test.m4s"
+        val secondRelay = "https://proxy-tf-all-tx.bilivideo.com/?url=https%3A%2F%2Fupos-sz-mirrorhw.bilivideo.com%2Fupgcxcode%2F54%2F12%2Fresume-test.m4s"
+        val otherRelay = "https://proxy-tf-all-tx.bilivideo.com/?url=https%3A%2F%2Fupos-sz-mirrorhw.bilivideo.com%2Fupgcxcode%2F54%2F12%2Fother.m4s"
+
+        BtrChunkEngine.rememberResumePrefix(task, ByteArray(32 * 1024), 2 * 1024 * 1024L, firstRelay, 1024 * 1024)
+        assertNotNull(BtrChunkEngine.resumePrefixFor(task, secondRelay))
+        assertNull(BtrChunkEngine.resumePrefixFor(task, otherRelay))
+    }
+
+    @Test
+    fun testRememberResumePrefixKeepsLongestSamePath() {
+        val task = BtrChunkEngine.ChunkTask(
+            index = 0,
+            startByte = 0,
+            endByte = (1024 * 1024 - 1).toLong()
+        )
+        val path = "/upgcxcode/54/12/resume-test.m4s"
+        val url = "https://upos-sz-mirrorcos.bilivideo.com$path"
+
+        BtrChunkEngine.rememberResumePrefix(task, ByteArray(32 * 1024), 2 * 1024 * 1024L, url, 1024 * 1024)
+        assertEquals(32 * 1024, task.resumePrefix?.bytes?.size)
+
+        BtrChunkEngine.rememberResumePrefix(task, ByteArray(64 * 1024), 2 * 1024 * 1024L, url, 1024 * 1024)
+        assertEquals(64 * 1024, task.resumePrefix?.bytes?.size)
+
+        BtrChunkEngine.rememberResumePrefix(task, ByteArray(600 * 1024), 2 * 1024 * 1024L, url, 1024 * 1024)
+        assertEquals(512 * 1024, task.resumePrefix?.bytes?.size)
+
+        BtrChunkEngine.rememberResumePrefix(
+            task,
+            ByteArray(96 * 1024),
+            2 * 1024 * 1024L,
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/other.m4s",
+            1024 * 1024
+        )
+        assertEquals(512 * 1024, task.resumePrefix?.bytes?.size)
     }
 
     private class FakeCall : Call {
