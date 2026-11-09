@@ -288,6 +288,10 @@ object PlayerHook {
             )
         }
         if (!io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "btr_skip reason=proxy_start_failed"
+            )
             return null
         }
 
@@ -325,6 +329,10 @@ object PlayerHook {
 
         val effectiveRelay = resolveEffectiveRelay(originalUrl, config)
         if (effectiveRelay.selection.allUnavailable) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "relay_all_unavailable mediaKey=${effectiveRelay.mediaKey.take(32)}"
+            )
             val fallbackUrl = BiliAcceleratorCore.safeDirectFallbackUrl(originalUrl)
             if (fallbackUrl != null) {
                 notifySafeFallback(originalUrl, fallbackUrl)

@@ -322,7 +322,7 @@ object BtrChunkEngine {
                 if (probeResult == null) {
                     val candidateHosts = candidateUrls.map { extractHostname(it) }.filter { it.isNotBlank() }.distinct()
                     Log.w(TAG, "BTR probe failed; session=${session.sessionId.take(6)} candidates=$candidateHosts")
-                    session.nativeDirectFallback = true
+                    session.armNativeDirectFallback()
                     io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
                         "BTR",
                         "native-fallback-started session=${session.sessionId.take(6)} reason=probe candidates=${candidateHosts.size}"
@@ -513,7 +513,7 @@ object BtrChunkEngine {
                     // P0: 杜绝死等！若分片彻底拉取失败，立即中断交付并触发播放器原生自愈/切集
                     if (currentTask.isFailed || currentTask.data == null) {
                         Log.e(TAG, "Chunk task #$nextDeliverIndex failed (${currentTask.errorMessage}). Aborting stream delivery to trigger player recovery.")
-                        session.nativeDirectFallback = true
+                        session.armNativeDirectFallback()
                         io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
                             "BTR",
                             "stream-failed session=${session.sessionId.take(6)} reason=chunk task=$nextDeliverIndex"
@@ -807,7 +807,12 @@ object BtrChunkEngine {
                             isNonRange = false
                         )
                     } else if (code == 403 || code >= 500) {
-                        penalizeHost(host, penaltyForHttpStatus(code))
+                        penalizeHost(
+                            host = host,
+                            baseDurationMs = penaltyForHttpStatus(code),
+                            markRelayHealth = httpStatusShouldMarkRelayHealth(code),
+                            adaptive = code >= 500
+                        )
                         if (host == primaryHost) {
                             reportFailover(host, "HTTP $code 错误", session.sessionId, candidateCount)
                         }
@@ -865,7 +870,7 @@ object BtrChunkEngine {
                     if (code == 200 || code == 206) {
                         val bytes = readChunkPayload(response, task.startByte, task.endByte)
                         if (bytes == null) {
-                            penalizeHost(host, 60_000L)
+                            penalizeHost(host, 10_000L, markRelayHealth = false, adaptive = false)
                             reportFailover(host, "分片 Range/长度校验失败", session.sessionId, candidateCount)
                             return@executeWithTracking
                         }
@@ -876,7 +881,12 @@ object BtrChunkEngine {
                         statsTracker.recordChunk(host, bytes.size.toLong(), latency)
                         return
                     } else if (code == 403 || code >= 500) {
-                        penalizeHost(host, penaltyForHttpStatus(code))
+                        penalizeHost(
+                            host = host,
+                            baseDurationMs = penaltyForHttpStatus(code),
+                            markRelayHealth = httpStatusShouldMarkRelayHealth(code),
+                            adaptive = code >= 500
+                        )
                         reportFailover(host, "HTTP $code 熔断", session.sessionId, candidateCount)
                     }
                 }
@@ -967,7 +977,7 @@ object BtrChunkEngine {
         message: String,
         candidateCount: Int
     ) {
-        penalizeHost(host, 60_000L)
+        penalizeHost(host, 10_000L, markRelayHealth = false, adaptive = false)
         if (host == primaryHost) {
             reportFailover(host, message, session.sessionId, candidateCount)
         }
@@ -988,7 +998,12 @@ object BtrChunkEngine {
             ?: ""
     }
 
-    private fun penalizeHost(host: String, baseDurationMs: Long) {
+    private fun penalizeHost(
+        host: String,
+        baseDurationMs: Long,
+        markRelayHealth: Boolean = true,
+        adaptive: Boolean = true
+    ) {
         if (host.isBlank()) return
         if (cdnPenalties.size >= MAX_PENALTY_ENTRIES) {
             val now = System.currentTimeMillis()
@@ -999,12 +1014,22 @@ object BtrChunkEngine {
             expiredHosts.forEach { cdnFailureCounts.remove(it) }
             if (cdnPenalties.size >= MAX_PENALTY_ENTRIES && !cdnPenalties.containsKey(host)) return
         }
-        val failures = cdnFailureCounts.compute(host) { _, previous ->
-            ((previous ?: 0) + 1).coerceAtMost(8)
-        } ?: 1
-        val adaptivePenalty = calculateAdaptivePenaltyMs(baseDurationMs, failures)
-        cdnPenalties[host] = System.currentTimeMillis() + adaptivePenalty
-        RelayHealthRegistry.markFailure(host, adaptivePenalty)
+        val failures = if (adaptive) {
+            cdnFailureCounts.compute(host) { _, previous ->
+                ((previous ?: 0) + 1).coerceAtMost(8)
+            } ?: 1
+        } else {
+            1
+        }
+        val effectivePenalty = if (adaptive) {
+            calculateAdaptivePenaltyMs(baseDurationMs, failures)
+        } else {
+            baseDurationMs.coerceAtLeast(1L)
+        }
+        cdnPenalties[host] = System.currentTimeMillis() + effectivePenalty
+        if (markRelayHealth) {
+            RelayHealthRegistry.markFailure(host, effectivePenalty)
+        }
     }
 
     private fun markHostHealthy(host: String) {
@@ -1015,8 +1040,10 @@ object BtrChunkEngine {
     }
 
     private fun penaltyForHttpStatus(code: Int): Long {
-        return if (code == 403) 60_000L else 30_000L
+        return if (code == 403) 10_000L else 30_000L
     }
+
+    internal fun httpStatusShouldMarkRelayHealth(code: Int): Boolean = code >= 500
 
     internal fun penaltyForFailureMessage(message: String): Long {
         val lower = message.lowercase(Locale.ROOT)

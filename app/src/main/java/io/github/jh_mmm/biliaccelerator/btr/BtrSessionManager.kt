@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 private const val DEFAULT_REFERER = "https://www.bilibili.com/"
 private const val BANGUMI_REFERER = "https://www.bilibili.com/bangumi/play/"
+internal const val NATIVE_DIRECT_FALLBACK_DURATION_MS = 45_000L
 
 data class BtrMediaSession(
     val sessionId: String,
@@ -20,11 +21,36 @@ data class BtrMediaSession(
     val isAudio: Boolean = false,
     val isEpisode: Boolean = false,
     @Volatile var nativeDirectFallback: Boolean = false,
+    @Volatile var nativeDirectFallbackUntil: Long = 0L,
     val createdAt: Long = System.currentTimeMillis(),
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
     @Volatile var totalLength: Long = -1L,
     @Volatile var contentType: String? = null
-)
+) {
+    fun armNativeDirectFallback(
+        now: Long = System.currentTimeMillis(),
+        durationMs: Long = NATIVE_DIRECT_FALLBACK_DURATION_MS
+    ) {
+        nativeDirectFallback = true
+        nativeDirectFallbackUntil = maxOf(nativeDirectFallbackUntil, now + durationMs.coerceAtLeast(1L))
+        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+            "BTR",
+            "native_direct_active session=${sessionId.take(6)} until=${nativeDirectFallbackUntil}"
+        )
+    }
+
+    fun isNativeDirectFallbackActive(now: Long = System.currentTimeMillis()): Boolean {
+        if (!nativeDirectFallback) return false
+        if (nativeDirectFallbackUntil > now) return true
+        nativeDirectFallback = false
+        nativeDirectFallbackUntil = 0L
+        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+            "BTR",
+            "native_direct_expired session=${sessionId.take(6)}"
+        )
+        return false
+    }
+}
 
 internal data class BtrCandidatePlan(
     val primaryUrl: String,
@@ -69,8 +95,14 @@ object BtrSessionManager {
         )
         sessions[id] = session
         latestSessionId = id
+        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+            "BTR",
+            "session_created session=${id.take(6)} active=${sessions.size}"
+        )
         return id
     }
+
+    fun activeSessionCountForDiagnostics(): Int = sessions.size
 
     /**
      * Direct UPOS streams are only accelerated when at least two trusted,

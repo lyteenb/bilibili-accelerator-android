@@ -544,14 +544,23 @@ class BtrEngineTest {
     }
 
     @Test
-    fun testNativeDirectFallbackIsSessionScoped() {
+    fun testHttp403IsNotTreatedAsGlobalRelayFailure() {
+        assertFalse("403 is usually URL-specific", BtrChunkEngine.httpStatusShouldMarkRelayHealth(403))
+        assertTrue("5xx can indicate a host-level problem", BtrChunkEngine.httpStatusShouldMarkRelayHealth(500))
+        assertTrue("5xx can indicate a host-level problem", BtrChunkEngine.httpStatusShouldMarkRelayHealth(503))
+    }
+
+    @Test
+    fun testNativeDirectFallbackExpiresInsteadOfPersistingForever() {
         val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
         val sessionId = BtrSessionManager.register(primary)
+        val now = 1_760_000_000_000L
         val session = BtrSessionManager.get(sessionId)
         assertFalse(session?.nativeDirectFallback ?: true)
 
-        session?.nativeDirectFallback = true
-        assertTrue("Native fallback flag must persist for the same session", BtrSessionManager.get(sessionId)?.nativeDirectFallback == true)
+        session?.armNativeDirectFallback(now = now, durationMs = 45_000L)
+        assertTrue("Native fallback should be active during cooldown", session?.isNativeDirectFallbackActive(now + 1_000L) == true)
+        assertFalse("Native fallback must expire so BTR can be retried", session?.isNativeDirectFallbackActive(now + 46_000L) == true)
     }
 
     private class FakeCall : Call {

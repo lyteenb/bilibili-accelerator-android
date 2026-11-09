@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicInteger
 
 object BtrLocalProxyServer {
 
@@ -35,6 +36,7 @@ object BtrLocalProxyServer {
     @Volatile private var configuredChunkSizeKb: Int = 512
     @Volatile private var configuredAutoConcurrency: Boolean = true
     @Volatile private var configuredAutoChunkSize: Boolean = true
+    private val activeClientSlots = AtomicInteger(0)
 
     @Synchronized
     fun start(concurrency: Int = 6, chunkSizeKb: Int = 512, autoConcurrency: Boolean = true, autoChunkSize: Boolean = true) {
@@ -58,6 +60,10 @@ object BtrLocalProxyServer {
             port = ss.localPort
             isRunning = true
             Log.i(TAG, "BTR Local Proxy Server successfully started on 127.0.0.1:$port")
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "btr_proxy_started port=$port activeSlots=${activeClientSlots.get()}"
+            )
 
             val acceptThread = Thread({
                 while (isRunning) {
@@ -74,6 +80,7 @@ object BtrLocalProxyServer {
                             continue
                         }
                         try {
+                            activeClientSlots.incrementAndGet()
                             executor.execute {
                                 try {
                                     handleClientSocket(
@@ -84,10 +91,12 @@ object BtrLocalProxyServer {
                                         autoChunkSize = configuredAutoChunkSize
                                     )
                                 } finally {
+                                    activeClientSlots.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
                                     slots.release()
                                 }
                             }
                         } catch (_: RejectedExecutionException) {
+                            activeClientSlots.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
                             slots.release()
                             client.close()
                         }
@@ -100,6 +109,10 @@ object BtrLocalProxyServer {
             acceptThread.start()
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to start BTR local loopback proxy: ${t.message}", t)
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "btr_proxy_start_failed reason=${t.message ?: t.javaClass.simpleName}"
+            )
             try {
                 serverSocket?.close()
             } catch (_: Throwable) {}
@@ -120,6 +133,7 @@ object BtrLocalProxyServer {
 
     @Synchronized
     fun stop() {
+        val wasRunning = isRunning
         isRunning = false
         try {
             serverSocket?.close()
@@ -128,8 +142,17 @@ object BtrLocalProxyServer {
         port = -1
         clientThreadPool?.shutdownNow()
         clientThreadPool = null
+        activeClientSlots.set(0)
         runCatching { BtrChunkEngine.cancelAllSessions() }
+        if (wasRunning) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
+                "BTR",
+                "btr_proxy_stopped activeSlots=${activeClientSlots.get()}"
+            )
+        }
     }
+
+    internal fun activeClientCountForDiagnostics(): Int = activeClientSlots.get()
 
     private fun handleClientSocket(
         client: Socket,
@@ -188,7 +211,7 @@ object BtrLocalProxyServer {
                     return
                 }
 
-                if (session.nativeDirectFallback) {
+                if (session.isNativeDirectFallbackActive()) {
                     io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
                         "BTR",
                         "native-direct-request session=${session.sessionId.take(6)} range=${range.first}-${range.second ?: "open"}"
