@@ -89,7 +89,10 @@ class HookEntry : XposedModule() {
                     autoChunkSize = config.btrAutoChunkSize
                 )
                 if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
-                    HookStatusTracker.recordStatus("btr_proxy", "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
+                    HookStatusTracker.recordStatus(
+                        "btr_proxy_${processName ?: packageName}",
+                        "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}"
+                    )
                 }
             }
 

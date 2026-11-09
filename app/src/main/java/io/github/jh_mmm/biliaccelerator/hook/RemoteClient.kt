@@ -174,17 +174,20 @@ object RemoteClient {
                 autoConcurrency = config.btrAutoConcurrency,
                 autoChunkSize = config.btrAutoChunkSize
             )
+            val process = resolveProcessName(context) ?: context.packageName
+            val statusKey = "btr_proxy_$process"
             if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
                 HookStatusTracker.recordStatus(
-                    "btr_proxy",
+                    statusKey,
                     "127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}"
                 )
             } else {
-                HookStatusTracker.recordStatus("btr_proxy", "start_failed")
+                HookStatusTracker.recordStatus(statusKey, "start_failed")
             }
         } else {
             io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.stop()
-            HookStatusTracker.recordStatus("btr_proxy", "disabled")
+            val process = resolveProcessName(context) ?: context.packageName
+            HookStatusTracker.recordStatus("btr_proxy_$process", "disabled")
         }
     }
 
