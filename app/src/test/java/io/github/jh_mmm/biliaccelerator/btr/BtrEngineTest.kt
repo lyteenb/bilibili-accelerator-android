@@ -9,6 +9,8 @@ import okhttp3.Callback
 import okhttp3.Request
 import okhttp3.Response
 import okio.Timeout
+import java.net.Socket
+import java.net.SocketException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -501,46 +503,70 @@ class BtrEngineTest {
 
     @Test
     fun testCancellingOldStreamDoesNotCancelNewStreamOnSameSession() {
-        BtrLocalProxyServer.stop()
+        val registry = BtrCallRegistry()
+        val old = registry.open("same-session")
+        val current = registry.open("same-session")
         val oldCall = FakeCall()
-        val newCall = FakeCall()
-        val sessionId = "same-session"
-        val oldKey = BtrChunkEngine.registerActiveCallForTesting(sessionId, oldCall)
-        val newKey = BtrChunkEngine.registerActiveCallForTesting(sessionId, newCall)
+        val currentCall = FakeCall()
+        val lateCall = FakeCall()
+        old.register(oldCall)
+        current.register(currentCall)
 
-        assertTrue(BtrChunkEngine.hasSessionStreamKeyForTesting(sessionId))
-        BtrChunkEngine.cancelStreamCallsForTesting(oldKey)
+        old.close()
+        assertTrue(oldCall.isCanceled())
+        assertFalse(currentCall.isCanceled())
+        assertFalse(old.register(lateCall))
+        assertTrue(lateCall.isCanceled())
+        assertEquals(1, registry.activeStreamCount())
 
-        assertTrue("Old stream should be cancelled", oldCall.isCanceled())
-        assertFalse("New stream must survive seek/old-connection cleanup", newCall.isCanceled())
-        assertEquals(1, BtrChunkEngine.activeStreamCallCountForTesting())
-        BtrChunkEngine.cancelStreamCallsForTesting(newKey)
+        registry.cancelAll()
+        assertTrue(currentCall.isCanceled())
+        assertEquals(0, registry.activeStreamCount())
+    }
+
+    @Test(timeout = 5000)
+    fun testLocalProxyStopClosesAcceptedSocketAndCanRestart() {
+        BtrLocalProxyServer.start()
+        try {
+            Socket("127.0.0.1", BtrLocalProxyServer.port).use { socket ->
+                socket.soTimeout = 2000
+                socket.getOutputStream().write("GET /stream/incomplete.m4s HTTP/1.1\r\n".toByteArray())
+                val deadline = System.nanoTime() + 1_000_000_000L
+                while (BtrLocalProxyServer.activeClientCountForDiagnostics() == 0 && System.nanoTime() < deadline) {
+                    Thread.sleep(5)
+                }
+                assertEquals(1, BtrLocalProxyServer.activeClientCountForDiagnostics())
+                BtrLocalProxyServer.stop()
+                try {
+                    assertEquals(-1, socket.getInputStream().read())
+                } catch (_: SocketException) {
+                    // A reset also proves the accepted connection was closed.
+                }
+            }
+            BtrLocalProxyServer.start()
+            Socket("127.0.0.1", BtrLocalProxyServer.port).use { socket ->
+                socket.soTimeout = 2000
+                socket.getOutputStream().write("GET /unknown HTTP/1.1\r\n\r\n".toByteArray())
+                assertTrue(socket.getInputStream().bufferedReader().readLine().startsWith("HTTP/1.1 404"))
+            }
+        } finally {
+            BtrLocalProxyServer.stop()
+        }
     }
 
     @Test
-    fun testLocalProxyStopCancelsEveryActiveStreamAndClearsKeys() {
-        BtrLocalProxyServer.stop()
-        val callA = FakeCall()
-        val callB = FakeCall()
-        BtrChunkEngine.registerActiveCallForTesting("session-a", callA)
-        BtrChunkEngine.registerActiveCallForTesting("session-b", callB)
-
-        BtrLocalProxyServer.stop()
-
-        assertTrue(callA.isCanceled())
-        assertTrue(callB.isCanceled())
-        assertEquals(0, BtrChunkEngine.activeStreamCallCountForTesting())
-    }
-
-    @Test
-    fun testUnregisterRemovesEmptyStreamKey() {
-        BtrLocalProxyServer.stop()
-        val call = FakeCall()
-        val key = BtrChunkEngine.registerActiveCallForTesting("session-cleanup", call)
-        BtrChunkEngine.unregisterActiveCallForTesting(key, call)
-
-        assertFalse(BtrChunkEngine.hasSessionStreamKeyForTesting("session-cleanup"))
-        assertEquals(0, BtrChunkEngine.activeStreamCallCountForTesting())
+    fun testCompletedCallIsRemovedWithoutClosingTheStream() {
+        val registry = BtrCallRegistry()
+        val stream = registry.open("session-cleanup")
+        val finished = FakeCall()
+        val pending = FakeCall()
+        assertTrue(stream.register(finished))
+        stream.unregister(finished)
+        assertTrue(stream.register(pending))
+        stream.close()
+        assertFalse(finished.isCanceled())
+        assertTrue(pending.isCanceled())
+        assertEquals(0, registry.activeStreamCount())
     }
 
     @Test
@@ -551,16 +577,22 @@ class BtrEngineTest {
     }
 
     @Test
-    fun testNativeDirectFallbackExpiresInsteadOfPersistingForever() {
-        val primary = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/12345.m4s"
-        val sessionId = BtrSessionManager.register(primary)
+    fun testDirectFallbackExpiresAndUsesFreshlySignedUrlOnReentry() {
+        val url = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/fallback-test.m4s"
+        val original = "$url?deadline=1"
+        val sessionId = BtrSessionManager.register(original)
         val now = 1_760_000_000_000L
-        val session = BtrSessionManager.get(sessionId)
-        assertFalse(session?.nativeDirectFallback ?: true)
-
-        session?.armNativeDirectFallback(now = now, durationMs = 45_000L)
-        assertTrue("Native fallback should be active during cooldown", session?.isNativeDirectFallbackActive(now + 1_000L) == true)
-        assertFalse("Native fallback must expire so BTR can be retried", session?.isNativeDirectFallbackActive(now + 46_000L) == true)
+        val session = requireNotNull(BtrSessionManager.get(sessionId))
+        try {
+            assertFalse(session.isDirectFallbackActive(now))
+            session.armDirectFallback(now)
+            assertTrue(session.isDirectFallbackActive(now + 1_000L))
+            assertFalse(session.isDirectFallbackActive(now + 46_000L))
+            val fresh = "$url?deadline=2"
+            assertEquals(fresh, BtrSessionManager.activeDirectFallback(fresh))
+        } finally {
+            session.clearDirectFallback()
+        }
     }
 
     private class FakeCall : Call {

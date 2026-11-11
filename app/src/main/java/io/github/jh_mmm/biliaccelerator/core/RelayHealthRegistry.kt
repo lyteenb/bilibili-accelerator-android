@@ -1,7 +1,5 @@
 package io.github.jh_mmm.biliaccelerator.core
 
-import java.util.concurrent.ConcurrentHashMap
-
 data class RelaySelection(
     val relayHost: String,
     val usedFallback: Boolean,
@@ -19,11 +17,16 @@ data class RelaySelection(
 object RelayHealthRegistry {
 
     private val lock = Any()
-    private val blockedUntil = ConcurrentHashMap<String, Long>()
+    private val blockedUntil = object : LinkedHashMap<String, Long>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+            size > 128
+    }
 
-    private var activeMediaKey: String? = null
-    private var activePreferredHost: String? = null
-    private var activeRelayHost: String? = null
+    private data class SelectionKey(val preferred: String, val media: String)
+    private val activeRelays = object : LinkedHashMap<SelectionKey, String?>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<SelectionKey, String?>?): Boolean =
+            size > 64
+    }
 
     fun selectRelay(
         preferredHost: String,
@@ -37,37 +40,20 @@ object RelayHealthRegistry {
                 allUnavailable = false
             )
         val candidates = relayCandidates(preferred)
-        val key = mediaKey.orEmpty().trim()
-        val allUnavailable = candidates.none { isHealthy(it, now) }
-        val sameSession = key.isNotEmpty() &&
-                key == activeMediaKey &&
-                preferred == activePreferredHost
-
-        val selected = if (sameSession) {
-            val sticky = activeRelayHost
-            when {
-                sticky != null && isHealthy(sticky, now) -> sticky
-                else -> candidates
-                    .asSequence()
-                    .filter { it != preferred }
-                    .firstOrNull { isHealthy(it, now) }
-                    ?: preferred.takeIf { isHealthy(it, now) }
-            }
-        } else {
-            preferred.takeIf { isHealthy(it, now) }
-                ?: candidates.firstOrNull { isHealthy(it, now) }
+        val key = mediaKey?.trim()?.takeIf { it.isNotEmpty() }?.let { SelectionKey(preferred, it) }
+        val sticky = key?.let(activeRelays::get)
+        val selected = when {
+            sticky != null && isHealthy(sticky, now) -> sticky
+            key != null && activeRelays.containsKey(key) -> candidates.firstOrNull { it != preferred && isHealthy(it, now) }
+                ?: preferred.takeIf { isHealthy(it, now) }
+            else -> candidates.firstOrNull { isHealthy(it, now) }
         }
-
-        if (key.isNotEmpty()) {
-            activeMediaKey = key
-            activePreferredHost = preferred
-            activeRelayHost = selected
-        }
+        if (key != null) activeRelays[key] = selected
 
         RelaySelection(
             relayHost = selected ?: preferred,
             usedFallback = selected != null && selected != preferred,
-            allUnavailable = allUnavailable
+            allUnavailable = selected == null
         )
     }
 
@@ -98,18 +84,14 @@ object RelayHealthRegistry {
 
     fun clearSession() {
         synchronized(lock) {
-            activeMediaKey = null
-            activePreferredHost = null
-            activeRelayHost = null
+            activeRelays.clear()
         }
     }
 
     fun resetForTesting() {
         synchronized(lock) {
             blockedUntil.clear()
-            activeMediaKey = null
-            activePreferredHost = null
-            activeRelayHost = null
+            activeRelays.clear()
         }
     }
 
@@ -121,7 +103,6 @@ object RelayHealthRegistry {
 
     private fun normalizedRelayHost(raw: String): String? {
         val host = BiliAcceleratorCore.cleanHost(raw).lowercase().substringBefore(':')
-        if (!host.startsWith("proxy-tf-all-")) return null
         if (!BiliAcceleratorCore.isOfficialBiliHost(host)) return null
         return host
     }

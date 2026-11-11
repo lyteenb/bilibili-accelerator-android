@@ -601,7 +601,7 @@ fun SettingsScreen(
 
                                 PreferenceSwitchItem(
                                     title = "BTR 自动动态线程调节",
-                                    summary = "智能感知播放缓冲状态，开播与Seek时高并发冲刺充填缓冲，稳定后回落以降低功耗",
+                                    summary = "开播和拖动进度后的前几片扩大预取窗口，随后回落到稳定并发",
                                     checked = config.btrAutoConcurrency,
                                     onCheckedChange = { onConfigChange(config.copy(btrAutoConcurrency = it)) },
                                     enabled = config.enabled && config.enableBtr
@@ -620,7 +620,7 @@ fun SettingsScreen(
                                     else -> "${config.btrConcurrency} 线程"
                                 }
                                 val concurrencySummary = if (config.btrAutoConcurrency) {
-                                    "基准 / 冲刺上限: $concurrencyDesc (自动动态调节中)"
+                                    "基准设置: $concurrencyDesc，冲刺窗口按节点类型与预取预算调整"
                                 } else {
                                     "固定并发: $concurrencyDesc"
                                 }
@@ -646,29 +646,26 @@ fun SettingsScreen(
                                 PreferenceDivider()
 
                                 // 2. 并发 CDN 节点池 - 滑块调节
-                                val poolSummary = when (config.btrCdnPoolSize) {
-                                    1 -> "1 个节点 · 仅单源拉取，不进行多源并发调度"
-                                    in 2..3 -> "${config.btrCdnPoolSize} 个节点 · 基础多源互备，低握手开销"
-                                    in 4..6 -> "${config.btrCdnPoolSize} 个节点 · 骨干云厂商节点均衡并发"
-                                    8 -> "8 个节点 · 推荐配置，官方多源全量并发拉取"
-                                    in 9..11 -> "${config.btrCdnPoolSize} 个节点 · 深度竞速，含全国混流节点"
-                                    else -> "12 个节点 · 全量白名单池跨源分片抢占"
+                                val poolSummary = if (config.btrCdnPoolSize == 1) {
+                                    "包含主节点。单源 UPOS 交给播放器直连"
+                                } else {
+                                    "最多 ${config.btrCdnPoolSize} 个节点，包含主节点"
                                 }
 
                                 PreferenceSliderItem(
                                     title = "并发 CDN 节点池",
                                     summary = poolSummary,
-                                    value = config.btrCdnPoolSize.coerceIn(1, 12).toFloat(),
+                                    value = config.btrCdnPoolSize.coerceIn(1, 32).toFloat(),
                                     onValueChange = { newVal ->
                                         val rounded = newVal.roundToInt()
                                         if (rounded != config.btrCdnPoolSize) {
                                             onConfigChange(config.copy(btrCdnPoolSize = rounded))
                                         }
                                     },
-                                    valueRange = 1f..12f,
-                                    steps = 10,
+                                    valueRange = 1f..32f,
+                                    steps = 30,
                                     showKeyPoints = true,
-                                    keyPoints = listOf(1f, 2f, 4f, 6f, 8f, 12f),
+                                    keyPoints = listOf(1f, 4f, 8f, 16f, 24f, 32f),
                                     valueLabel = "${config.btrCdnPoolSize} 个节点",
                                     enabled = config.enabled && config.enableBtr
                                 )

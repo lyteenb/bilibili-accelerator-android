@@ -12,6 +12,8 @@ import com.google.gson.Gson
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.IpcSecurity
+import io.github.jh_mmm.biliaccelerator.core.DebugEvent
+import io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.jh_mmm.biliaccelerator.provider.StatsProvider
 import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
@@ -55,6 +57,9 @@ object RemoteClient {
     private var pendingFlushFuture: ScheduledFuture<*>? = null
     private val flushLock = Any()
     private val lastBroadcastTime = AtomicLong(0L)
+    private val pendingDebug = ArrayDeque<DebugEvent>()
+    private var debugFlushScheduled = false
+    private const val MAX_PENDING_DEBUG = 200
 
     @Volatile
     private var appContext: Context? = null
@@ -66,6 +71,7 @@ object RemoteClient {
             context
         }
         appContext = app
+        DebugEventBuffer.setForwarder(::queueDebugEvent)
 
         registerConfigObserver(app)
 
@@ -113,7 +119,7 @@ object RemoteClient {
                 if (saved != null) {
                     cachedConfig = saved
                     hasResolvedConfig = true
-                    io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(saved.enableDebugLogging)
+                    applyDebugLogging(saved.enableDebugLogging)
                     Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
                 }
             }
@@ -164,7 +170,7 @@ object RemoteClient {
     private fun applyResolvedConfig(context: Context, config: AcceleratorConfig) {
         cachedConfig = config
         hasResolvedConfig = true
-        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(config.enableDebugLogging)
+        applyDebugLogging(config.enableDebugLogging)
         lastConfigFetchTime.set(System.currentTimeMillis())
         saveConfigToLocalCache(context, config)
         if (config.enabled && config.enableBtr) {
@@ -314,15 +320,7 @@ object RemoteClient {
         // 2. 兜底通道：若 Provider 不可达（如高版本 Android 包可见性拦截），发送握手显式广播
         if (!handshakeOk) {
             try {
-                val authIntent = Intent().apply {
-                    setPackage(pkgName)
-                }
-                val authToken = PendingIntent.getBroadcast(
-                    context,
-                    0,
-                    authIntent,
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                )
+                val authToken = broadcastAuthToken(context)
 
                 val intent = Intent(StatsReceiver.ACTION_HANDSHAKE).apply {
                     setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
@@ -337,6 +335,73 @@ object RemoteClient {
                 Log.i(TAG, "Successfully sent handshake to module via broadcast fallback from $pkgName ($procName, v$verName)")
             } catch (t: Throwable) {
                 Log.w(TAG, "sendHandshakeDirect via broadcast failed: ${t.message}")
+            }
+        }
+    }
+
+    private fun broadcastAuthToken(context: Context): PendingIntent = PendingIntent.getBroadcast(
+        context,
+        0,
+        Intent().setPackage(context.packageName),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    private fun applyDebugLogging(enabled: Boolean) {
+        DebugEventBuffer.setEnabled(enabled)
+        if (!enabled) synchronized(pendingDebug) { pendingDebug.clear() }
+    }
+
+    private fun queueDebugEvent(event: DebugEvent) {
+        synchronized(pendingDebug) {
+            if (!DebugEventBuffer.isEnabled) return
+            if (pendingDebug.size >= MAX_PENDING_DEBUG) pendingDebug.removeFirst()
+            pendingDebug.addLast(event)
+            if (!debugFlushScheduled) {
+                debugFlushScheduled = true
+                reportScheduler.schedule(::flushDebugEvents, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
+            }
+        }
+    }
+
+    private fun flushDebugEvents() {
+        val batch = synchronized(pendingDebug) {
+            if (!DebugEventBuffer.isEnabled) pendingDebug.clear()
+            val count = minOf(pendingDebug.size, DebugEventBuffer.IPC_BATCH_SIZE)
+            List(count) { pendingDebug.removeFirst() }
+        }
+        try {
+            val context = appContext ?: return
+            if (batch.isEmpty() || !DebugEventBuffer.isEnabled) return
+            val json = DebugEventBuffer.encodeHostEvents(batch)
+            val process = resolveProcessName(context)
+            val delivered = runCatching {
+                val extras = Bundle().apply {
+                    putString(StatsProvider.EXTRA_DEBUG_EVENTS, json)
+                    putString(StatsProvider.EXTRA_CLIENT_PROCESS, process)
+                }
+                context.contentResolver.call(
+                    StatsProvider.CONTENT_URI, StatsProvider.METHOD_RECORD_DEBUG_EVENTS, null, extras
+                )?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true
+            }.getOrDefault(false)
+            if (!delivered) {
+                runCatching {
+                    val intent = Intent(StatsReceiver.ACTION_RECORD_DEBUG_EVENTS).apply {
+                        setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
+                        addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                        putExtra(StatsProvider.EXTRA_DEBUG_EVENTS, json)
+                        putExtra(StatsReceiver.EXTRA_CLIENT_PROCESS, process)
+                        putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, broadcastAuthToken(context))
+                    }
+                    context.sendBroadcast(intent)
+                }
+            }
+        } finally {
+            synchronized(pendingDebug) {
+                if (pendingDebug.isEmpty()) {
+                    debugFlushScheduled = false
+                } else {
+                    reportScheduler.schedule(::flushDebugEvents, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                }
             }
         }
     }
@@ -425,15 +490,7 @@ object RemoteClient {
             if (timeSinceLastBroadcast >= 1000L) {
                 lastBroadcastTime.set(now)
                 try {
-                    val authIntent = Intent().apply {
-                        setPackage(context.packageName)
-                    }
-                    val authToken = PendingIntent.getBroadcast(
-                        context,
-                        0,
-                        authIntent,
-                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                    )
+                    val authToken = broadcastAuthToken(context)
 
                     val procName = resolveProcessName(context) ?: context.packageName
                     val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {

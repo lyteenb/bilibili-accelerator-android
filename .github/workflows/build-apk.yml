@@ -81,23 +81,31 @@ jobs:
           KEY_PASS: ${{ secrets.KEY_PASSWORD }}
 
       - name: Run Lint & Unit Tests
+        shell: bash
         run: |
-          ./gradlew lintDebug testDebugUnitTest --stacktrace 2>&1 | tee build.log || {
-            ERR=$(grep -E "(e: |error:|FAILURE:)" build.log | head -n 20 | tr '\n' ' ')
-            echo "::error::Gradle Error: $ERR"
+          set +e
+          ./gradlew lintDebug testDebugUnitTest --stacktrace 2>&1 | tee build.log
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            ERR=$(grep -E "(e: |error:|FAILURE:)" build.log | head -n 20 | tr '\n' ' ' || true)
+            echo "::error::Lint or unit tests failed (exit $status): $ERR"
             tail -n 100 build.log
-            exit 1
-          }
+            exit "$status"
+          fi
 
       - name: Build Release APK
+        shell: bash
         run: |
+          set +e
           ./gradlew assembleRelease --stacktrace 2>&1 | tee release.log
-          STATUS=${PIPESTATUS[0]}
-          if [ "$STATUS" -ne 0 ] || grep -q "BUILD FAILED" release.log; then
-            ERR=$(grep -E "(e: |error:|FAILURE:|FAILED|Exception:)" release.log | head -n 30 | tr '\n' ' ' | tr '\r' ' ')
-            echo "::error::Release build failed (exit $STATUS): $ERR"
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            ERR=$(grep -E "(e: |error:|FAILURE:|FAILED|Exception:)" release.log | head -n 30 | tr '\n' ' ' || true)
+            echo "::error::Release build failed (exit $status): $ERR"
             tail -n 100 release.log
-            exit 1
+            exit "$status"
           fi
         env:
           KEYSTORE_FILE: release.jks

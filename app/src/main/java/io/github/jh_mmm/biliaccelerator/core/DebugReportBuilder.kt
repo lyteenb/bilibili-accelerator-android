@@ -173,7 +173,7 @@ object DebugReportBuilder {
         if (debugEvents.events.isEmpty()) {
             sb.appendLine("<empty>")
         } else {
-            debugEvents.events.forEach { event ->
+            debugEvents.events.sortedBy { it.timestamp }.forEach { event ->
                 sb.appendLine("[${formatTimestamp(event.timestamp)}] [${event.category}] ${event.message}")
             }
         }

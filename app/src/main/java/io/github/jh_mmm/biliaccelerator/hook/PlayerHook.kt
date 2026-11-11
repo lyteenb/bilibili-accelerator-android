@@ -35,6 +35,9 @@ object PlayerHook {
     )
 
     private fun resolveEffectiveRelay(originalUrl: String, config: AcceleratorConfig): EffectiveRelay {
+        if (!BiliAcceleratorCore.usesRelay(originalUrl, config)) {
+            return EffectiveRelay(config, RelaySelection(config.proxyHost, false, false), "")
+        }
         val mediaKey = BiliAcceleratorCore.playbackSessionKey(originalUrl)
         val selection = RelayHealthRegistry.selectRelay(config.proxyHost, mediaKey)
         return EffectiveRelay(
@@ -49,7 +52,7 @@ object PlayerHook {
         val fallback = BiliAcceleratorCore.parseUri(fallbackUrl)
         RemoteClient.notifyRewrite(
             RewriteResult(
-                changed = false,
+                changed = originalUrl != fallbackUrl,
                 originalUrl = originalUrl,
                 finalUrl = fallbackUrl,
                 originalHost = original?.host ?: "",
@@ -174,16 +177,25 @@ object PlayerHook {
                         return@intercept chain.proceed()
                     }
                     val effectiveConfig = effectiveRelay.config
+                    val wrappedBackups = mutableMapOf<String, String>()
                     val distinctFiltered = if (effectiveConfig.blockPcdn || effectiveConfig.proxyMcdn || effectiveConfig.forceUpos) {
                         filterAndFillBackupUrls(rawList, effectiveConfig) { res ->
+                            if (BiliAcceleratorCore.isRelayWrapper(res.finalUrl) &&
+                                BiliAcceleratorCore.unwrapRelayUrl(res.finalUrl) == BiliAcceleratorCore.unwrapRelayUrl(res.originalUrl)
+                            ) {
+                                wrappedBackups[res.originalUrl] = res.finalUrl
+                            }
                             RemoteClient.notifyRewrite(res)
                         }
                     } else {
                         rawList.distinct()
                     }
 
+                    // Only native backups and wrappers that preserve the signed media
+                    // are explicit BTR candidates. Authority substitutions need probing.
+                    val btrBackups = rawList.map { wrappedBackups[it] ?: it }.distinct()
                     chain.thisObject?.let { builder ->
-                        builderPendingBackups[builder] = distinctFiltered
+                        builderPendingBackups[builder] = btrBackups
                     }
 
                     if (effectiveConfig.enableBtr && io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
@@ -191,9 +203,9 @@ object PlayerHook {
                             io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.getSessionForBuilder(it)
                         }
                         if (boundSessionId != null) {
-                            io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.updateBackups(boundSessionId, distinctFiltered)
+                            io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.updateBackups(boundSessionId, btrBackups)
                         } else {
-                            io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.updateBackupsByCandidateUrls(distinctFiltered)
+                            io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.updateBackupsByCandidateUrls(btrBackups)
                         }
                     }
 
@@ -241,14 +253,16 @@ object PlayerHook {
             Log.i(TAG, "DRM protected stream detected, bypassing BTR proxy")
             return null
         }
-        val isEpisode = BiliAcceleratorCore.isEpisodeMediaUrl(originalUrl) ||
+        val mediaUrl = BiliAcceleratorCore.unwrapRelayUrl(originalUrl) ?: originalUrl
+        if (BiliAcceleratorCore.hasDrmSignal(mediaUrl)) return null
+        val isEpisode = BiliAcceleratorCore.isEpisodeMediaUrl(mediaUrl) ||
                 (result.changed && BiliAcceleratorCore.isEpisodeMediaUrl(result.finalUrl))
         if (isEpisode) {
             if (!config.enableEpisodeAcceleration) {
                 Log.i(TAG, "Episode acceleration disabled, leaving episode stream to native player")
                 return null
             }
-            if (BiliAcceleratorCore.isEpisodePreview(originalUrl) ||
+            if (BiliAcceleratorCore.isEpisodePreview(mediaUrl) ||
                 (result.changed && BiliAcceleratorCore.isEpisodePreview(result.finalUrl))
             ) {
                 Log.i(TAG, "Episode preview detected, leaving stream to native player")
@@ -256,6 +270,7 @@ object PlayerHook {
             }
         }
 
+        if (result.reason == "akamai-pass") return null
         val targetUrl = if (result.changed) result.finalUrl else originalUrl
         if (!io.github.jh_mmm.biliaccelerator.btr.BtrHttpSafety.isAllowedUpstreamUrl(targetUrl)) {
             return null
@@ -295,27 +310,33 @@ object PlayerHook {
             return null
         }
 
-        val isAudio = BiliAcceleratorCore.isAudioTrack(targetUrl)
+        val isAudio = BiliAcceleratorCore.isAudioTrack(originalUrl) || BiliAcceleratorCore.isAudioTrack(targetUrl)
 
         val sessionId = io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.register(
             primaryUrl = targetUrl,
             backupUrls = pendingBackups,
             isAudio = isAudio,
             isEpisode = isEpisode,
-            config = config
+            config = config,
+            originalUrl = originalUrl
         )
         if (builderInstance != null) {
             io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.bindBuilderSession(builderInstance, sessionId)
         }
         val proxyPort = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port
+        if (proxyPort <= 0) return null
         return "http://127.0.0.1:$proxyPort/stream/$sessionId.m4s"
     }
 
-    private fun rewriteArgIfMedia(args: List<Any?>, builderInstance: Any? = null): Array<Any?>? {
-        val strIndex = args.indexOfFirst { it is String && BiliAcceleratorCore.hasMediaSignal(it) }
+    private fun rewriteArgIfMedia(
+        args: List<Any?>,
+        builderInstance: Any? = null,
+        strIndex: Int = args.indexOfFirst { it is String && BiliAcceleratorCore.hasMediaSignal(it) }
+    ): Array<Any?>? {
         if (strIndex == -1) return null
 
-        val originalUrl = args[strIndex] as String
+        val originalUrl = args.getOrNull(strIndex) as? String ?: return null
+        if (!BiliAcceleratorCore.hasMediaSignal(originalUrl)) return null
         val config = RemoteClient.fetchConfig()
         if (!config.enabled) return null
 
@@ -328,21 +349,16 @@ object PlayerHook {
         }
 
         val effectiveRelay = resolveEffectiveRelay(originalUrl, config)
-        if (effectiveRelay.selection.allUnavailable) {
-            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-                "BTR",
-                "relay_all_unavailable mediaKey=${effectiveRelay.mediaKey.take(32)}"
-            )
-            val fallbackUrl = BiliAcceleratorCore.safeDirectFallbackUrl(originalUrl)
+        val cachedFallback = if (config.enableBtr) {
+            io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager.activeDirectFallback(originalUrl)
+        } else null
+        if (cachedFallback != null || effectiveRelay.selection.allUnavailable) {
+            val fallbackUrl = cachedFallback ?: BiliAcceleratorCore.safeDirectFallbackUrl(originalUrl)
             if (fallbackUrl != null) {
                 notifySafeFallback(originalUrl, fallbackUrl)
-                if (fallbackUrl != originalUrl) {
-                    val newArgs = args.toTypedArray()
-                    newArgs[strIndex] = fallbackUrl
-                    return newArgs
-                }
-                return null
+                if (fallbackUrl != originalUrl) return args.toTypedArray().apply { this[strIndex] = fallbackUrl }
             }
+            return null
         }
 
         val result = BiliAcceleratorCore.rewriteUrl(originalUrl, effectiveRelay.config)
@@ -378,43 +394,8 @@ object PlayerHook {
             try {
                 val setDataSourceMethod = ijkPlayerClass.getDeclaredMethod("setDataSource", String::class.java)
                 module.hook(setDataSourceMethod).intercept { chain ->
-                    val original = chain.args.getOrNull(0) as? String
-                    if (original != null && BiliAcceleratorCore.hasMediaSignal(original)) {
-                        val config = RemoteClient.fetchConfig()
-                        if (config.enabled) {
-                            val parsed = BiliAcceleratorCore.parseUri(original)
-                            if (parsed != null && BiliAcceleratorCore.isLiveMediaUrl(parsed.path, original)) {
-                                RemoteClient.notifyRewrite(BiliAcceleratorCore.rewriteUrl(original, config))
-                                return@intercept chain.proceed()
-                            }
-                            val effectiveRelay = resolveEffectiveRelay(original, config)
-                            if (effectiveRelay.selection.allUnavailable) {
-                                val fallbackUrl = BiliAcceleratorCore.safeDirectFallbackUrl(original)
-                                if (fallbackUrl != null) {
-                                    notifySafeFallback(original, fallbackUrl)
-                                    if (fallbackUrl != original) {
-                                        val newArgs = chain.args.toTypedArray().apply { this[0] = fallbackUrl }
-                                        return@intercept chain.proceed(newArgs)
-                                    }
-                                    return@intercept chain.proceed()
-                                }
-                            }
-                            val result = BiliAcceleratorCore.rewriteUrl(original, effectiveRelay.config)
-                            val btrUrl = tryRewriteToBtr(original, result, effectiveRelay.config, chain.thisObject)
-                            if (btrUrl != null) {
-                                Log.i(TAG, "Rewrote IjkMediaPlayer dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
-                                val newArgs = chain.args.toTypedArray().apply { this[0] = btrUrl }
-                                return@intercept chain.proceed(newArgs)
-                            }
-                            RemoteClient.notifyRewrite(result)
-                            if (result.changed) {
-                                Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> ${result.targetHost}")
-                                val newArgs = chain.args.toTypedArray().apply { this[0] = result.finalUrl }
-                                return@intercept chain.proceed(newArgs)
-                            }
-                        }
-                    }
-                    chain.proceed()
+                    val args = rewriteArgIfMedia(chain.args, chain.thisObject, strIndex = 0)
+                    if (args == null) chain.proceed() else chain.proceed(args)
                 }
                 fallbackHooked = true
             } catch (_: NoSuchMethodException) {}
@@ -426,46 +407,12 @@ object PlayerHook {
             for (m in uriMethods) {
                 try {
                     module.hook(m).intercept { chain ->
-                        val originalUri = chain.args.getOrNull(1) as? Uri
-                        if (originalUri != null) {
-                            val original = originalUri.toString()
-                            if (BiliAcceleratorCore.hasMediaSignal(original)) {
-                                val config = RemoteClient.fetchConfig()
-                                if (config.enabled) {
-                                    val parsed = BiliAcceleratorCore.parseUri(original)
-                                    if (parsed != null && BiliAcceleratorCore.isLiveMediaUrl(parsed.path, original)) {
-                                        RemoteClient.notifyRewrite(BiliAcceleratorCore.rewriteUrl(original, config))
-                                        return@intercept chain.proceed()
-                                    }
-                                    val effectiveRelay = resolveEffectiveRelay(original, config)
-                                    if (effectiveRelay.selection.allUnavailable) {
-                                        val fallbackUrl = BiliAcceleratorCore.safeDirectFallbackUrl(original)
-                                        if (fallbackUrl != null) {
-                                            notifySafeFallback(original, fallbackUrl)
-                                            if (fallbackUrl != original) {
-                                                val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(fallbackUrl) }
-                                                return@intercept chain.proceed(newArgs)
-                                            }
-                                            return@intercept chain.proceed()
-                                        }
-                                    }
-                                    val result = BiliAcceleratorCore.rewriteUrl(original, effectiveRelay.config)
-                                    val btrUrl = tryRewriteToBtr(original, result, effectiveRelay.config, chain.thisObject)
-                                    if (btrUrl != null) {
-                                        Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource to BTR: 127.0.0.1:${io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port}")
-                                        val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(btrUrl) }
-                                        return@intercept chain.proceed(newArgs)
-                                    }
-                                    RemoteClient.notifyRewrite(result)
-                                    if (result.changed) {
-                                        Log.i(TAG, "Rewrote IjkMediaPlayer Uri dataSource: ${result.originalHost} -> ${result.targetHost}")
-                                        val newArgs = chain.args.toTypedArray().apply { this[1] = Uri.parse(result.finalUrl) }
-                                        return@intercept chain.proceed(newArgs)
-                                    }
-                                }
-                            }
-                        }
-                        chain.proceed()
+                        val originalUri = chain.args.getOrNull(1) as? Uri ?: return@intercept chain.proceed()
+                        val stringArgs = chain.args.toMutableList().apply { this[1] = originalUri.toString() }
+                        val args = rewriteArgIfMedia(stringArgs, chain.thisObject, strIndex = 1)
+                            ?: return@intercept chain.proceed()
+                        args[1] = Uri.parse(args[1] as String)
+                        chain.proceed(args)
                     }
                     fallbackHooked = true
                 } catch (_: Throwable) {}

@@ -6,11 +6,14 @@ import java.util.Collections
 import java.util.UUID
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicLong
 
 private const val DEFAULT_REFERER = "https://www.bilibili.com/"
 private const val BANGUMI_REFERER = "https://www.bilibili.com/bangumi/play/"
 internal const val NATIVE_DIRECT_FALLBACK_DURATION_MS = 45_000L
+
+private fun monotonicMillis(): Long = System.nanoTime() / 1_000_000L
 
 data class BtrMediaSession(
     val sessionId: String,
@@ -20,36 +23,76 @@ data class BtrMediaSession(
     @Volatile var referer: String = DEFAULT_REFERER,
     val isAudio: Boolean = false,
     val isEpisode: Boolean = false,
-    @Volatile var nativeDirectFallback: Boolean = false,
-    @Volatile var nativeDirectFallbackUntil: Long = 0L,
+    val originalUrl: String = primaryUrl,
+    internal val config: AcceleratorConfig? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val lastAccessed: AtomicLong = AtomicLong(System.currentTimeMillis()),
     @Volatile var totalLength: Long = -1L,
     @Volatile var contentType: String? = null
 ) {
-    fun armNativeDirectFallback(
-        now: Long = System.currentTimeMillis(),
-        durationMs: Long = NATIVE_DIRECT_FALLBACK_DURATION_MS
-    ) {
-        nativeDirectFallback = true
-        nativeDirectFallbackUntil = maxOf(nativeDirectFallbackUntil, now + durationMs.coerceAtLeast(1L))
-        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-            "BTR",
-            "native_direct_active session=${sessionId.take(6)} until=${nativeDirectFallbackUntil}"
-        )
+    internal val safeFallbackUrl = BiliAcceleratorCore.safeDirectFallbackUrl(originalUrl)
+    @Volatile internal var candidatePlan: BtrCandidatePlan? = null
+    @Volatile internal var sample: BtrMediaSample? = null
+    internal val verifiedCandidates = ConcurrentHashMap<String, BtrMediaSample>()
+    internal val routeMetrics = BtrRouteMetrics()
+    private val verificationSlots = Array(16) { Semaphore(1, true) }
+
+    internal fun verificationSlot(url: String): Semaphore =
+        verificationSlots[Math.floorMod(url.hashCode(), verificationSlots.size)]
+    @Volatile private var fallbackUntil = 0L
+    private val rejectedUrls = object : LinkedHashMap<String, Long>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean = size > 64
     }
 
-    fun isNativeDirectFallbackActive(now: Long = System.currentTimeMillis()): Boolean {
-        if (!nativeDirectFallback) return false
-        if (nativeDirectFallbackUntil > now) return true
-        nativeDirectFallback = false
-        nativeDirectFallbackUntil = 0L
-        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-            "BTR",
-            "native_direct_expired session=${sessionId.take(6)}"
-        )
+    @Synchronized
+    internal fun cacheSample(candidate: BtrMediaSample, type: String): BtrMediaSample {
+        val previous = sample
+        if (previous == null || previous.totalLength != candidate.totalLength ||
+            previous.bytes.size < candidate.bytes.size ||
+            (previous.start == candidate.start && previous.bytes.size == candidate.bytes.size &&
+                !previous.bytes.contentEquals(candidate.bytes))
+        ) {
+            verifiedCandidates.clear()
+            sample = candidate
+        }
+        contentType = type
+        totalLength = candidate.totalLength
+        return sample ?: candidate
+    }
+
+    @Synchronized
+    internal fun rejectUrl(url: String) {
+        rejectedUrls[url] = monotonicMillis() + 10_000L
+    }
+
+    @Synchronized
+    internal fun isUrlRejected(url: String): Boolean {
+        val until = rejectedUrls[url] ?: return false
+        if (until > monotonicMillis()) return true
+        rejectedUrls.remove(url)
         return false
     }
+
+    @Synchronized
+    internal fun armDirectFallback(now: Long = monotonicMillis()) {
+        if (safeFallbackUrl == null) return
+        fallbackUntil = maxOf(fallbackUntil, now + NATIVE_DIRECT_FALLBACK_DURATION_MS)
+        BtrSessionManager.recordDirectFallback(originalUrl, fallbackUntil)
+    }
+
+    internal fun activeFallbackDeadline(now: Long = monotonicMillis()): Long? =
+        fallbackUntil.takeIf { it != 0L && it > now }
+
+    internal fun isDirectFallbackActive(now: Long = monotonicMillis()): Boolean =
+        activeFallbackDeadline(now) != null
+
+    @Synchronized
+    internal fun clearDirectFallback(expected: Long = fallbackUntil) {
+        if (expected == 0L || fallbackUntil != expected) return
+        fallbackUntil = 0L
+        BtrSessionManager.clearDirectFallback(originalUrl, expected)
+    }
+
 }
 
 internal data class BtrCandidatePlan(
@@ -58,7 +101,8 @@ internal data class BtrCandidatePlan(
     val candidateHosts: List<String>,
     val isRelay: Boolean,
     val isDirectUpos: Boolean,
-    val hasMultiSource: Boolean
+    val hasMultiSource: Boolean,
+    val synthesizedUrls: Set<String>
 )
 
 object BtrSessionManager {
@@ -69,19 +113,52 @@ object BtrSessionManager {
     private val sessions = ConcurrentHashMap<String, BtrMediaSession>()
     private val builderSessionMap = Collections.synchronizedMap(WeakHashMap<Any, String>())
 
-    @Volatile
-    private var latestSessionId: String? = null
+    private const val MAX_DIRECT_FALLBACKS = 128
+    private data class FallbackKey(val host: String, val media: BiliAcceleratorCore.MediaIdentity)
+    private val directFallbacks = object : LinkedHashMap<FallbackKey, Long>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<FallbackKey, Long>?): Boolean =
+            size > MAX_DIRECT_FALLBACKS
+    }
 
+    private fun fallbackKey(url: String): FallbackKey? {
+        val direct = BiliAcceleratorCore.safeDirectFallbackUrl(url) ?: return null
+        val identity = BiliAcceleratorCore.mediaIdentity(direct) ?: return null
+        return FallbackKey(cleanHost(direct), identity)
+    }
+
+    @Synchronized
+    internal fun recordDirectFallback(url: String, until: Long = monotonicMillis() + NATIVE_DIRECT_FALLBACK_DURATION_MS) {
+        val key = fallbackKey(url) ?: return
+        directFallbacks[key] = maxOf(directFallbacks[key] ?: until, until)
+    }
+
+    @Synchronized
+    internal fun clearDirectFallback(url: String, expected: Long) {
+        val key = fallbackKey(url) ?: return
+        directFallbacks.remove(key, expected)
+    }
+
+    @Synchronized
+    internal fun activeDirectFallback(url: String): String? {
+        val key = fallbackKey(url) ?: return null
+        val until = directFallbacks[key] ?: return null
+        if (until > monotonicMillis()) return BiliAcceleratorCore.safeDirectFallbackUrl(url)
+        directFallbacks.remove(key)
+        return null
+    }
+
+    @Synchronized
     fun register(
         primaryUrl: String,
         backupUrls: List<String> = emptyList(),
         userAgent: String? = null,
         isAudio: Boolean = false,
         isEpisode: Boolean = false,
-        config: AcceleratorConfig? = null
+        config: AcceleratorConfig? = null,
+        originalUrl: String = primaryUrl
     ): String {
         cleanupStaleSessions()
-        val id = UUID.randomUUID().toString().replace("-", "").take(12)
+        val id = UUID.randomUUID().toString().replace("-", "")
         val plan = buildCandidatePlan(primaryUrl, backupUrls, config, isEpisode)
         val referer = if (isEpisode) BANGUMI_REFERER else DEFAULT_REFERER
         val session = BtrMediaSession(
@@ -91,10 +168,12 @@ object BtrSessionManager {
             userAgent = userAgent,
             referer = referer,
             isAudio = isAudio,
-            isEpisode = isEpisode
+            isEpisode = isEpisode,
+            originalUrl = originalUrl,
+            config = config
         )
+        session.candidatePlan = plan
         sessions[id] = session
-        latestSessionId = id
         io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
             "BTR",
             "session_created session=${id.take(6)} active=${sessions.size}"
@@ -136,6 +215,7 @@ object BtrSessionManager {
         val uri = BiliAcceleratorCore.parseUri(primaryUrl)
         val primaryHost = BiliAcceleratorCore.cleanHost(uri?.host).lowercase()
         val isRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
+        val identity = BiliAcceleratorCore.mediaIdentity(primaryUrl)
         val isDirectUpos = !isRelay &&
                 uri != null &&
                 uri.path.contains("/upgcxcode/") &&
@@ -143,6 +223,10 @@ object BtrSessionManager {
                 !BiliAcceleratorCore.isAkamaiHost(primaryHost)
         val safeExplicitBackups = backupUrls
             .filter { BtrHttpSafety.isAllowedUpstreamUrl(it) && it != primaryUrl }
+            .filter { !BiliAcceleratorCore.isLiveMediaUrl("", it) &&
+                !BiliAcceleratorCore.hasDrmSignal(BiliAcceleratorCore.unwrapRelayUrl(it).orEmpty()) &&
+                !BiliAcceleratorCore.isEpisodePreview(BiliAcceleratorCore.unwrapRelayUrl(it).orEmpty()) }
+            .filter { identity != null && BiliAcceleratorCore.mediaIdentity(it) == identity }
             .filter { BiliAcceleratorCore.isRelayUrl(it) == isRelay }
             .filter { isRelay || isSameRegion(primaryHost, it) }
             .distinct()
@@ -153,7 +237,7 @@ object BtrSessionManager {
         } else {
             emptyList()
         }
-        val poolLimit = config?.btrCdnPoolSize?.coerceIn(1, 32) ?: 8
+        val poolLimit = config?.btrCdnPoolSize?.coerceIn(1, 32)?.minus(1) ?: 8
         val finalBackups = (safeExplicitBackups + synthesized)
             .filter { BtrHttpSafety.isAllowedUpstreamUrl(it) && it != primaryUrl }
             .filter { BiliAcceleratorCore.isRelayUrl(it) == isRelay }
@@ -170,7 +254,8 @@ object BtrSessionManager {
             candidateHosts = candidateHosts,
             isRelay = isRelay,
             isDirectUpos = isDirectUpos,
-            hasMultiSource = candidateHosts.size >= 2
+            hasMultiSource = candidateHosts.size >= 2,
+            synthesizedUrls = finalBackups.filterNot { it in safeExplicitBackups }.toSet()
         )
     }
 
@@ -190,61 +275,23 @@ object BtrSessionManager {
 
     fun updateBackups(sessionId: String, backups: List<String>) {
         val current = sessions[sessionId] ?: return
-        if (backups.any { BiliAcceleratorCore.isLiveMediaUrl("", it) }) {
-            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-                "BTR",
-                "rejected live backups session=${sessionId.take(6)} count=${backups.size}"
-            )
-            return
-        }
-        val validBackups = backups
-            .filter { BtrHttpSafety.isAllowedUpstreamUrl(it) && it != current.primaryUrl }
-            .distinct()
-        val primaryHost = cleanHost(current.primaryUrl)
-        val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(current.primaryUrl)
-        val isolatedBackups = if (isPrimaryRelay) {
-            val relayBackups = synthesizeRelayWrapperBackups(current.primaryUrl, null)
-            (validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) } + relayBackups)
-                .distinct()
-        } else {
-            validBackups.filter { !BiliAcceleratorCore.isRelayUrl(it) && isSameRegion(primaryHost, it) }
-        }
-        current.backupUrls = isolatedBackups
-    }
+        if (backups.isEmpty() || backups.any { BiliAcceleratorCore.isLiveMediaUrl("", it) }) return
+        val identity = BiliAcceleratorCore.mediaIdentity(current.primaryUrl) ?: return
+        if (backups.none { BiliAcceleratorCore.mediaIdentity(it) == identity }) return
 
-    fun updateBackupsForLatest(backups: List<String>) {
-        val id = latestSessionId ?: return
-        updateBackups(id, backups)
+        val plan = buildCandidatePlan(current.primaryUrl, backups, current.config, current.isEpisode)
+        current.candidatePlan = plan
+        current.backupUrls = plan.backupUrls
     }
 
     fun updateBackupsByCandidateUrls(backups: List<String>) {
-        if (backups.isEmpty()) return
-        if (backups.any { BiliAcceleratorCore.isLiveMediaUrl("", it) }) {
-            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-                "BTR",
-                "rejected live candidate backup list count=${backups.size}"
-            )
-            return
-        }
-        val samplePath = extractComparablePath(backups.first())
-        if (samplePath.isNotBlank()) {
-            for ((sessionId, session) in sessions) {
-                if (extractComparablePath(session.primaryUrl) == samplePath) {
-                    updateBackups(sessionId, backups)
-                    return
-                }
-            }
-        }
-        // Never fall back to the most recently created session when the media
-        // path does not match. That could mix unrelated VOD/live resources.
-        io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-            "BTR",
-            "unmatched backup list ignored path=${samplePath.take(48)}"
-        )
-    }
-
-    private fun extractComparablePath(url: String): String {
-        return BiliAcceleratorCore.parseUri(url)?.path ?: ""
+        if (backups.isEmpty() || backups.any { BiliAcceleratorCore.isLiveMediaUrl("", it) }) return
+        val identities = backups.mapNotNull(BiliAcceleratorCore::mediaIdentity).distinct()
+        val identity = identities.singleOrNull() ?: return
+        val session = sessions.values.filter {
+            BiliAcceleratorCore.mediaIdentity(it.primaryUrl) == identity
+        }.singleOrNull() ?: return
+        updateBackups(session.sessionId, backups)
     }
 
     private fun cleanHost(value: String): String {
@@ -350,14 +397,12 @@ object BtrSessionManager {
     ): List<String> {
         val uri = BiliAcceleratorCore.parseUri(primaryUrl) ?: return emptyList()
         val host = BiliAcceleratorCore.cleanHost(uri.host).lowercase()
-        if (!host.startsWith("proxy-tf-all-")) return emptyList()
-        if (uri.path.isNotBlank() && uri.path != "/") return emptyList()
-        if (uri.queryParam("url").isNullOrBlank()) return emptyList()
+        if (!BiliAcceleratorCore.isRelayWrapper(primaryUrl)) return emptyList()
 
         val preferred = config?.proxyHost?.let { BiliAcceleratorCore.cleanHost(it).lowercase() }
         val candidates = (listOfNotNull(preferred) + BiliAcceleratorCore.OFFICIAL_RELAY_HOSTS)
             .map { BiliAcceleratorCore.cleanHost(it).lowercase() }
-            .filter { it.startsWith("proxy-tf-all-") && it != host }
+            .filter { BiliAcceleratorCore.isOfficialBiliHost(it) && it != host }
             .distinct()
         val limit = config?.btrCdnPoolSize?.coerceIn(1, 32) ?: candidates.size
         return candidates.take(limit).map { candidate -> uri.replaceAuthority(candidate) }

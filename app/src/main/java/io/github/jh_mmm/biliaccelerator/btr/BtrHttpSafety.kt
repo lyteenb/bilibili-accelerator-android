@@ -64,33 +64,35 @@ internal object BtrHttpSafety {
         if (body == null) return ByteArray(0)
         if (maxBytes < 0 || maxBytes > MAX_UPSTREAM_BODY_BYTES) return null
 
-        val hardLimit = maxBytes + 1
-        val output = ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
-        val buffer = ByteArray(32 * 1024)
-        var total = 0
-
-        body.byteStream().use { input ->
-            while (total < hardLimit) {
-                val wanted = minOf(buffer.size, hardLimit - total)
-                val read = input.read(buffer, 0, wanted)
-                if (read == -1) break
-                output.write(buffer, 0, read)
-                total += read
+        val declared = body.contentLength()
+        if (declared > maxBytes) return null
+        val bytes = ByteArray(maxBytes)
+        return body.byteStream().use { input ->
+            var offset = 0
+            while (offset < maxBytes) {
+                val read = input.read(bytes, offset, maxBytes - offset)
+                if (read < 0) return@use bytes.copyOf(offset)
+                offset += read
             }
+            if (input.read() < 0) bytes else null
         }
-
-        return if (total > maxBytes) null else output.toByteArray()
     }
 
     fun parseContentRange(value: String?): ParsedContentRange? {
         val match = value?.trim()?.let { CONTENT_RANGE_REGEX.matchEntire(it) } ?: return null
         val start = match.groupValues[1].toLongOrNull() ?: return null
         val end = match.groupValues[2].toLongOrNull() ?: return null
-        val total = match.groupValues[3].takeUnless { it == "*" }?.toLongOrNull()
+        val totalField = match.groupValues[3]
+        val total = if (totalField == "*") null else totalField.toLongOrNull() ?: return null
         if (start < 0 || end < start) return null
         if (total != null && (total <= end || total <= 0L)) return null
         return ParsedContentRange(start = start, end = end, total = total)
     }
+
+    fun parseUnsatisfiedLength(value: String?): Long? =
+        value?.trim()?.takeIf { it.startsWith("bytes */", ignoreCase = true) }
+            ?.substring(8)?.takeIf { it.isNotEmpty() && it.all { digit -> digit in '0'..'9' } }
+            ?.toLongOrNull()
 }
 
 /**
@@ -125,6 +127,7 @@ internal object BoundedHttpRequestParser {
         if (!path.startsWith('/')) throw IllegalArgumentException("Invalid request path")
 
         val headers = LinkedHashMap<String, String>()
+        var headerCount = 0
         while (true) {
             val line = readLineLimited(buffered, MAX_HEADER_LINE_BYTES)
                 ?: throw IllegalArgumentException("Unexpected EOF in headers")
@@ -134,7 +137,7 @@ internal object BoundedHttpRequestParser {
             if (totalHeaderBytes > MAX_TOTAL_HEADER_BYTES) {
                 throw HttpRequestTooLargeException("Headers exceed total limit")
             }
-            if (headers.size >= MAX_HEADERS) {
+            if (++headerCount > MAX_HEADERS) {
                 throw HttpRequestTooLargeException("Too many headers")
             }
 
@@ -157,6 +160,7 @@ internal object BoundedHttpRequestParser {
     private fun readLineLimited(input: InputStream, maxBytes: Int): String? {
         val output = ByteArrayOutputStream(minOf(maxBytes, 256))
         var sawAny = false
+        var wireBytes = 0
         while (true) {
             val value = input.read()
             if (value == -1) {
@@ -165,11 +169,10 @@ internal object BoundedHttpRequestParser {
             }
             sawAny = true
             if (value == '\n'.code) break
-            if (value == '\r'.code) continue
-            if (output.size() >= maxBytes) {
+            if (++wireBytes > maxBytes + 1 || (wireBytes == maxBytes + 1 && value != '\r'.code)) {
                 throw HttpRequestTooLargeException("HTTP line exceeds $maxBytes bytes")
             }
-            output.write(value)
+            if (value != '\r'.code) output.write(value)
         }
         return String(output.toByteArray(), Charsets.US_ASCII)
     }

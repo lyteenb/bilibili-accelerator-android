@@ -313,12 +313,19 @@ class BiliAcceleratorCoreTest {
 
     @Test
     fun testPlaybackSessionKeyAndSafeDirectFallback() {
-        val direct = "https://xy113x207x104x10xy.mcdn.bilivideo.cn/upgcxcode/54/12/43384242545-1-100029.m4s?deadline=1"
+        val direct = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/43384242545-1-100029.m4s?deadline=1"
         val wrapped = "https://proxy-tf-all-ws.bilivideo.com/?url=" + java.net.URLEncoder.encode(direct, "UTF-8")
-        assertEquals("43384242545", BiliAcceleratorCore.playbackSessionKey(direct))
-        assertEquals("43384242545", BiliAcceleratorCore.playbackSessionKey(wrapped))
+        assertEquals("/upgcxcode/54/12/43384242545", BiliAcceleratorCore.playbackSessionKey(direct))
+        assertEquals("/upgcxcode/54/12/43384242545", BiliAcceleratorCore.playbackSessionKey(wrapped))
         assertEquals(direct, BiliAcceleratorCore.safeDirectFallbackUrl(direct))
         assertEquals(direct, BiliAcceleratorCore.safeDirectFallbackUrl(wrapped))
+        assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://xy123.mcdn.bilivideo.cn/upgcxcode/1.m4s"))
+        assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://upos-sz-mirrorcos.bilivideo.com:8443/upgcxcode/1.m4s"))
+        assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://upos-sz-mirrorcos.bilivideo.com/v1/resource/1.m4s"))
+        assertFalse(BiliAcceleratorCore.usesRelay(direct, AcceleratorConfig()))
+        assertTrue(BiliAcceleratorCore.usesRelay(wrapped, AcceleratorConfig()))
+        val audio = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/43384242545-30280.m4s"
+        assertTrue(BiliAcceleratorCore.isAudioTrack("https://proxy-tf-all-ws.bilivideo.com/?url=" + java.net.URLEncoder.encode(audio, "UTF-8")))
         assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("http://xy113x207x104x10xy.mcdn.bilivideo.cn/upgcxcode/1.m4s"))
         assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://112.34.56.78:8080/upgcxcode/1.m4s"))
         assertNull(BiliAcceleratorCore.safeDirectFallbackUrl("https://example.com/upgcxcode/1.m4s"))
@@ -375,6 +382,13 @@ class BiliAcceleratorCoreTest {
         assertTrue(resProxyAll.changed)
         assertTrue(resProxyAll.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
         assertEquals("mcdn-proxy", resProxyAll.reason)
+
+        val proxyV1 = defaultConfig.copy(mcdnStrategy = "proxy-v1")
+        val ordinary = BiliAcceleratorCore.rewriteUrl(
+            "https://xy1.mcdn.bilivideo.cn/upgcxcode/1.m4s?deadline=123", proxyV1
+        )
+        assertEquals("mcdn-host", ordinary.reason)
+        assertTrue(ordinary.finalUrl.contains("/upgcxcode/1.m4s?deadline=123"))
 
         // 2. proxy-v1 策略：对 /v1/resource/ 流走 proxy-tf-all-ws 代理
         val resProxyV1 = BiliAcceleratorCore.rewriteUrl(mcdnV1Url, defaultConfig.copy(mcdnStrategy = "proxy-v1"))

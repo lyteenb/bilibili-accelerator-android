@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.core
 
 import android.net.Uri
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import io.github.jh_mmm.biliaccelerator.BuildConfig
 import java.net.URI
 import java.net.URLDecoder
@@ -130,16 +131,14 @@ object BiliAcceleratorCore {
     )
 
     /**
-     * 判断当前系统是否处于海外环境（根据时区与语言环境自适应加权）
+     * 按设备时区选择默认节点池，具体媒体优先按 Host 分区
      */
     fun isOverseasEnvironment(): Boolean {
         return try {
             val tzId = java.util.TimeZone.getDefault().id.lowercase()
-            val country = java.util.Locale.getDefault().country.uppercase()
             val isMainlandTz = tzId.contains("shanghai") || tzId.contains("chongqing") ||
                     tzId.contains("harbin") || tzId.contains("urumqi") || tzId == "prc" || tzId == "cst"
-            val isMainlandLocale = country == "CN"
-            !isMainlandTz || (!isMainlandLocale && !isMainlandTz)
+            !isMainlandTz
         } catch (_: Throwable) {
             false
         }
@@ -351,6 +350,7 @@ object BiliAcceleratorCore {
         val host = cleanHost(parsed.host).lowercase().substringBefore(':')
         val path = parsed.path.lowercase()
         return isMcdnHost(host) ||
+                isRelayWrapper(url) ||
                 host == "proxy-tf-all-ws.bilivideo.com" ||
                 host.startsWith("proxy-tf-all-") ||
                 path.startsWith("/v1/resource/") ||
@@ -486,9 +486,13 @@ object BiliAcceleratorCore {
     }
 
     fun isLiveMediaUrl(path: String, fullUrl: String = ""): Boolean {
-        val lowerPath = path.lowercase()
-        val lowerUrl = fullUrl.lowercase()
-        return lowerPath.contains("/live-bvc/") ||
+        val media = if (fullUrl.isEmpty()) fullUrl else unwrapRelayUrl(fullUrl) ?: fullUrl
+        val lowerPath = if (media != fullUrl || path.isBlank()) {
+            parseUri(media)?.path.orEmpty().lowercase()
+        } else path.lowercase()
+        val lowerUrl = media.lowercase()
+        return lowerPath.endsWith(".flv") || lowerPath.endsWith(".m3u8") ||
+                lowerPath.contains("/live-bvc/") ||
                 lowerPath.contains("/live-stream/") ||
                 lowerPath.contains("/live-flv/") ||
                 lowerUrl.contains("gotcha") ||
@@ -535,11 +539,12 @@ object BiliAcceleratorCore {
 
     fun isAudioTrack(url: String): Boolean {
         if (url.isBlank()) return false
-        val lowerUrl = url.lowercase()
+        val mediaUrl = unwrapRelayUrl(url) ?: url
+        val lowerUrl = mediaUrl.lowercase()
         val pathPart = lowerUrl.substringBefore('?').substringBefore('#')
         if (pathPart.contains("audio") || pathPart.contains("sound") || pathPart.contains("dolby") || pathPart.contains("flac") || pathPart.contains("hires")) return true
         if (AUDIO_REP_REGEX.containsMatchIn(pathPart)) return true
-        val parsed = parseUri(url)
+        val parsed = parseUri(mediaUrl)
         val idParam = parsed?.queryParam("id") ?: parsed?.queryParam("rep_id")
         if (idParam != null && (idParam.matches(Regex("""^30(2\d\d|25\d)$""")) || idParam.contains("audio") || idParam.contains("flac"))) return true
         val codecs = parsed?.queryParam("codecs")?.lowercase()
@@ -578,40 +583,59 @@ object BiliAcceleratorCore {
         return fileName.take(96)
     }
 
-    fun playbackSessionKey(rawUrl: String): String {
-        val outer = parseUri(rawUrl) ?: return ""
-        val embedded = outer.queryParam("url")?.takeIf { it.isNotBlank() }
-        val effective = embedded?.let { parseUri(it) } ?: outer
-        val fileName = effective.path.substringAfterLast('/').trim()
-        if (fileName.isBlank()) return effective.path.take(96)
-        val stem = fileName.substringBefore('?').substringBefore('.')
-        val mediaId = stem.replace(Regex("""-\d+-\d+$"""), "").trim()
-        return (mediaId.ifBlank { stem }).take(96)
+    internal fun isRelayWrapper(url: String): Boolean {
+        val parsed = parseUri(url) ?: return false
+        return isOfficialBiliHost(parsed.host) &&
+            (parsed.path == "/" || parsed.path.isEmpty()) &&
+            !parsed.queryParam("url").isNullOrBlank()
     }
 
-    /**
-     * Returns a direct URL only when every relay is unhealthy and the original
-     * URL is a trusted HTTPS official Bilibili media/CDN URL. PCDN, HTTP,
-     * literal IP and non-official hosts are deliberately rejected.
-     */
-    fun safeDirectFallbackUrl(rawUrl: String): String? {
-        var current = rawUrl
+    internal fun unwrapRelayUrl(url: String): String? {
+        var current = url
         repeat(3) {
-            val parsed = parseUri(current) ?: return null
-            val host = cleanHost(parsed.host).lowercase().substringBefore(':')
-            val embedded = parsed.queryParam("url")?.takeIf { it.isNotBlank() }
-            if (host.startsWith("proxy-tf-all-")) {
-                if (embedded == null) return null
-                current = embedded
-                return@repeat
-            }
-            if (parsed.scheme != "https") return null
-            if (isLoopbackHost(host)) return null
-            if (!isOfficialBiliHost(host)) return null
-            if (!hasMediaSignal(current)) return null
-            return current
+            if (!isRelayWrapper(current)) return current
+            current = parseUri(current)?.queryParam?.invoke("url") ?: return null
         }
-        return null
+        return current.takeUnless(::isRelayWrapper)
+    }
+
+    internal data class MediaIdentity(val path: String, val representation: List<String?>)
+
+    internal fun mediaIdentity(url: String): MediaIdentity? {
+        val media = unwrapRelayUrl(url)?.toHttpUrlOrNull() ?: return null
+        val path = media.encodedPath
+        if (path.isBlank() || path == "/") return null
+        val representation = listOf("id", "rep_id", "quality", "qn", "codecs", "mimeType")
+            .map(media::queryParameter)
+        return MediaIdentity(path, representation)
+    }
+
+    fun playbackSessionKey(rawUrl: String): String {
+        val path = mediaIdentity(rawUrl)?.path ?: return ""
+        val stem = path.substringAfterLast('/').substringBeforeLast('.')
+        return path.substringBeforeLast('/', "") + "/" +
+            stem.replace(Regex("""-\d+-\d+$"""), "")
+    }
+
+    internal fun usesRelay(url: String, config: AcceleratorConfig): Boolean {
+        if (isRelayWrapper(url)) return true
+        if (!config.proxyMcdn || hasDrmSignal(url)) return false
+        val parsed = parseUri(url) ?: return false
+        val isMcdn = isMcdnHost(parsed.host) || parsed.queryParam("os").equals("mcdn", ignoreCase = true)
+        return isMcdn && (shouldProxyMcdn(true, parsed.path, config) ||
+            (config.mcdnStrategy.equals("replace", ignoreCase = true) && parsed.path.startsWith("/v1/resource/")))
+    }
+
+    fun safeDirectFallbackUrl(rawUrl: String): String? {
+        val direct = unwrapRelayUrl(rawUrl) ?: return null
+        val url = direct.toHttpUrlOrNull() ?: return null
+        if (!direct.startsWith("https://", ignoreCase = true) || !url.isHttps || url.port != 443 ||
+            url.username.isNotEmpty() || url.password.isNotEmpty() ||
+            !isOfficialBiliHost(url.host) || isKnownP2pHost(url.host) ||
+            isRelayUrl(direct) || isLiveMediaUrl(url.encodedPath, direct) ||
+            hasDrmSignal(direct) || isEpisodePreview(direct) || !hasMediaSignal(url.encodedPath)
+        ) return null
+        return direct
     }
 
     fun rewriteUrl(original: String, config: AcceleratorConfig): RewriteResult {
@@ -627,10 +651,6 @@ object BiliAcceleratorCore {
         }
 
         val cleanProxyHost = resolveProxyHost(config)
-        if (hostname == cleanProxyHost) {
-            return noChange(original, "already-proxied", isMcdn = true)
-        }
-
         val isLive = isLiveMediaUrl(parsed.path, original)
 
         // Live streams are passed through unchanged. Their paths and
@@ -638,6 +658,23 @@ object BiliAcceleratorCore {
         // filtering or authority substitution can make playback fail.
         if (isLive) {
             return noChange(original, "live-ok", isPcdn = false, isMcdn = false, segmentKey = segKey)
+        }
+
+        if (isRelayWrapper(original)) {
+            if (!config.proxyMcdn || hostname == cleanProxyHost) {
+                return noChange(original, "already-proxied", isMcdn = true)
+            }
+            return RewriteResult(
+                changed = true,
+                originalUrl = original,
+                finalUrl = parsed.replaceAuthority(cleanProxyHost),
+                originalHost = hostname,
+                targetHost = cleanProxyHost,
+                reason = "mcdn-proxy",
+                isPcdn = false,
+                isMcdn = true,
+                segmentKey = segKey
+            )
         }
 
         val port = parsed.port
@@ -703,7 +740,10 @@ object BiliAcceleratorCore {
                 } else {
                     return noChange(original, "ok", isMcdn = true, segmentKey = segKey)
                 }
-            } else if (config.mcdnStrategy.equals("replace", ignoreCase = true) || config.forceUpos) {
+            } else if (config.mcdnStrategy.equals("replace", ignoreCase = true) ||
+                config.forceUpos ||
+                (config.mcdnStrategy.equals("proxy-v1", ignoreCase = true) && parsed.path.startsWith("/upgcxcode/"))
+            ) {
                 // 关键防护（对齐 BTR Issue #47）：
                 // 若 MCDN 路径以 /v1/resource/ 开头，普通 UPOS 节点没有中继资源，直接换 Host 必报 HTTP 403！
                 // 遇到此类地址必须强制降级走官方 CDN 中继代理 (proxyWrap)，杜绝 403 熔断。

@@ -75,6 +75,8 @@ class StatsProvider : ContentProvider() {
 
         const val EXTRA_REWRITE_BATCH_JSON = "extra_rewrite_batch_json"
         const val EXTRA_CONFIG_JSON = "extra_config_json"
+        const val METHOD_RECORD_DEBUG_EVENTS = "record_debug_events"
+        const val EXTRA_DEBUG_EVENTS = "extra_debug_events"
         const val EXTRA_HOOK_STATUS_JSON = "extra_hook_status_json"
         const val EXTRA_CLIENT_PACKAGE = "extra_client_package"
         const val EXTRA_CLIENT_VERSION = "extra_client_version"
@@ -253,6 +255,14 @@ class StatsProvider : ContentProvider() {
         val response = Bundle()
 
         when (method) {
+            METHOD_RECORD_DEBUG_EVENTS -> {
+                io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.ingestHostEvents(
+                    extras?.getString(EXTRA_DEBUG_EVENTS),
+                    callingPackage,
+                    extras?.getString(EXTRA_CLIENT_PROCESS)
+                )
+                response.putBoolean(EXTRA_SUCCESS, true)
+            }
             METHOD_RECORD_BATCH_REWRITE -> {
                 val json = extras?.getString(EXTRA_REWRITE_BATCH_JSON)
                 if (!json.isNullOrEmpty()) {

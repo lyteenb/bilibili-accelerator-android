@@ -20,6 +20,7 @@ class StatsReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION_RECORD_REWRITE = "io.github.jh_mmm.biliaccelerator.ACTION_RECORD_REWRITE"
+        const val ACTION_RECORD_DEBUG_EVENTS = "io.github.jh_mmm.biliaccelerator.ACTION_RECORD_DEBUG_EVENTS"
         const val ACTION_HANDSHAKE = "io.github.jh_mmm.biliaccelerator.ACTION_HANDSHAKE"
         const val EXTRA_REWRITE_RESULT = "extra_rewrite_result"
         const val EXTRA_REWRITE_BATCH_JSON = "extra_rewrite_batch_json"
@@ -102,7 +103,7 @@ class StatsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         if (context == null || intent == null) return
         val action = intent.action
-        if (action != ACTION_RECORD_REWRITE && action != ACTION_HANDSHAKE) return
+        if (action != ACTION_RECORD_REWRITE && action != ACTION_HANDSHAKE && action != ACTION_RECORD_DEBUG_EVENTS) return
 
         // AMS 会为 PendingIntent 填充 creatorUid/creatorPackage。Uid is the
         // primary identity; creatorPackage can be null in clones/work profiles.
@@ -131,6 +132,15 @@ class StatsReceiver : BroadcastReceiver() {
             io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.setEnabled(
                 StatsProvider.loadConfig(context).enableDebugLogging
             )
+        }
+
+        if (action == ACTION_RECORD_DEBUG_EVENTS) {
+            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.ingestHostEvents(
+                intent.getStringExtra(StatsProvider.EXTRA_DEBUG_EVENTS),
+                trustedCreator,
+                intent.getStringExtra(EXTRA_CLIENT_PROCESS)
+            )
+            return
         }
 
         // 3. 处理独立握手广播 (ACTION_HANDSHAKE)

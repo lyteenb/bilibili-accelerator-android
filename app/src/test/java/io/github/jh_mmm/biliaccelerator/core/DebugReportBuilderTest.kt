@@ -8,6 +8,25 @@ import org.junit.Test
 class DebugReportBuilderTest {
 
     @Test
+    fun testAuthenticatedHostBatchCanBeImportedWithSensitiveFieldsRedacted() {
+        DebugEventBuffer.setEnabled(true)
+        try {
+            val hostBatch = listOf(DebugEvent(
+                System.currentTimeMillis(), "BTR",
+                "probe_failed host=upos.bilivideo.com https://upos.bilivideo.com/test?token=private session=secret"
+            ))
+            DebugEventBuffer.ingestHostEvents(DebugEventBuffer.encodeHostEvents(hostBatch), "tv.danmaku.bili", "tv.danmaku.bili:player")
+            val host = DebugEventBuffer.snapshot().events.single { it.category == "HOST/BTR" }
+            assertTrue(host.message.contains("source=tv.danmaku.bili:player"))
+            assertTrue(host.message.contains("host=upos.bilivideo.com"))
+            assertFalse(host.message.contains("private"))
+            assertFalse(host.message.contains("secret"))
+        } finally {
+            DebugEventBuffer.setEnabled(false)
+        }
+    }
+
+    @Test
     fun testDetailedDebugReportContainsRuntimeAndAllLogs() {
         val now = 1_760_000_000_000L
         val snapshot = StatsSnapshot(
