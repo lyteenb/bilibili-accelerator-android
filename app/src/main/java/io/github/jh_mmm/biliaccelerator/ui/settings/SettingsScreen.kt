@@ -81,9 +81,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import java.net.URL
-import javax.net.ssl.HttpsURLConnection
+import java.io.IOException
+import java.net.SocketTimeoutException
 import kotlin.math.roundToInt
 
 enum class SettingsSubPage {
@@ -1009,11 +1008,10 @@ private fun ProxyHostDialog(
     )
 }
 
-data class UposTestState(
-    val host: String,
-    val latencyMs: Long? = null,
+private data class UposTestState(
+    val response: UposProbeResponse? = null,
     val isTesting: Boolean = false,
-    val error: String? = null
+    val error: IOException? = null
 )
 
 @Composable
@@ -1028,55 +1026,25 @@ private fun UposSpeedTestDialog(
     var isTestingAll by remember { mutableStateOf(false) }
     var testJob by remember { mutableStateOf<Job?>(null) }
     var testStates by remember {
-        mutableStateOf(uposValues.associateWith { host ->
-            UposTestState(host = host, isTesting = false)
-        })
-    }
-
-    fun probeUposHostLatencyMs(host: String): Long {
-        val t0 = System.currentTimeMillis()
-        val conn = (URL("https://$host/crossdomain.xml").openConnection() as HttpsURLConnection).apply {
-            requestMethod = "HEAD"
-            connectTimeout = 2500
-            readTimeout = 2500
-            instanceFollowRedirects = false
-            useCaches = false
-            setRequestProperty("User-Agent", "Mozilla/5.0 BiliDroid/8.0.0 (bbcallen@gmail.com)")
-            setRequestProperty("Connection", "close")
-        }
-        try {
-            conn.connect()
-            val code = conn.responseCode
-            if (code !in 200..399) {
-                throw IllegalStateException("HTTP $code")
-            }
-            return (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-        } finally {
-            runCatching { conn.disconnect() }
-        }
+        mutableStateOf(uposValues.associateWith { UposTestState() })
     }
 
     fun startSpeedTest() {
         if (isTestingAll) return
         testJob?.cancel()
         isTestingAll = true
-        testStates = uposValues.associateWith { host ->
-            UposTestState(host = host, isTesting = true)
-        }
+        testStates = uposValues.associateWith { UposTestState(isTesting = true) }
         testJob = coroutineScope.launch {
             try {
                 val results = withContext(Dispatchers.IO) {
                     uposValues.map { host ->
                         async {
-                            try {
-                                val lat = withTimeout(3000L) {
-                                    probeUposHostLatencyMs(host)
-                                }
-                                host to UposTestState(host = host, latencyMs = lat, isTesting = false)
-                            } catch (e: Exception) {
-                                val err = if (e is kotlinx.coroutines.TimeoutCancellationException) "超时" else (e.message ?: "失败")
-                                host to UposTestState(host = host, latencyMs = null, isTesting = false, error = err)
+                            val state = try {
+                                UposTestState(response = probeUposHost(host))
+                            } catch (error: IOException) {
+                                UposTestState(error = error)
                             }
+                            host to state
                         }
                     }.awaitAll()
                 }
@@ -1095,13 +1063,15 @@ private fun UposSpeedTestDialog(
         uposValues.sortedWith(
             compareBy<String> { host ->
                 val state = testStates[host]
+                val status = state?.response?.statusCode ?: 0
                 when {
-                    state?.isTesting == true -> 1
-                    state?.latencyMs != null -> 0
-                    else -> 2
+                    status in 200..399 -> 0
+                    state?.response != null -> 1
+                    state?.isTesting == true -> 2
+                    else -> 3
                 }
             }.thenBy { host ->
-                testStates[host]?.latencyMs ?: Long.MAX_VALUE
+                testStates[host]?.response?.latencyMs ?: Long.MAX_VALUE
             }
         )
     }
@@ -1143,7 +1113,7 @@ private fun UposSpeedTestDialog(
                 )
 
                 sortedHosts.forEach { host ->
-                    val state = testStates[host] ?: UposTestState(host = host)
+                    val state = testStates[host] ?: UposTestState()
                     val isCurrent = host.equals(currentTargetHost, ignoreCase = true)
                     val displayName = io.github.jh_mmm.biliaccelerator.ui.dashboard.resolveUposDisplayName(
                         targetHost = host,
@@ -1198,9 +1168,12 @@ private fun UposSpeedTestDialog(
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                        } else if (state.latencyMs != null) {
-                            val latency = state.latencyMs
+                        } else if (state.response != null) {
+                            val response = state.response
+                            val latency = response.latencyMs
                             val (badgeBg, badgeTextColor) = when {
+                                response.statusCode !in 200..399 ->
+                                    MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
                                 latency < 80L -> (if (dark) Color(0xFF143320) else Color(0xFFE8F8F0)) to Color(0xFF2ECC71)
                                 latency < 200L -> (if (dark) Color(0xFF112938) else Color(0xFFE3F2FD)) to Color(0xFF00AEEC)
                                 latency < 400L -> (if (dark) Color(0xFF382E11) else Color(0xFFFFF8E1)) to Color(0xFFF39C12)
@@ -1208,7 +1181,7 @@ private fun UposSpeedTestDialog(
                             }
 
                             Text(
-                                text = "${latency} ms",
+                                text = stringResource(R.string.speed_test_response, response.statusCode, latency),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = badgeTextColor,
@@ -1219,7 +1192,11 @@ private fun UposSpeedTestDialog(
                             )
                         } else {
                             Text(
-                                text = state.error ?: stringResource(R.string.speed_test_timeout),
+                                text = if (state.error is SocketTimeoutException) {
+                                    stringResource(R.string.speed_test_connection_timeout)
+                                } else {
+                                    state.error?.message ?: stringResource(R.string.speed_test_timeout)
+                                },
                                 fontSize = 11.sp,
                                 color = Color(0xFFE74C3C),
                                 modifier = Modifier
