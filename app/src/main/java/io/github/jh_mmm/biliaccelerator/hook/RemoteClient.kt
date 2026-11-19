@@ -45,10 +45,10 @@ object RemoteClient {
     private var cachedConfig: AcceleratorConfig = AcceleratorConfig(enabled = false)
     @Volatile
     private var hasResolvedConfig = false
-    private val lastConfigFetchTime = AtomicLong(0L)
-    private val isFetching = AtomicBoolean(false)
+    private val configRefresh = ConfigRefreshState()
     private val configObserverRegistered = AtomicBoolean(false)
-    private const val CONFIG_CACHE_TTL = 30_000L
+    private val configCacheNanos = TimeUnit.SECONDS.toNanos(30)
+    private val configRetryNanos = TimeUnit.SECONDS.toNanos(5)
 
     private val pendingBatch = ConcurrentLinkedQueue<RewriteResult>()
     private const val BATCH_MAX_SIZE = 10
@@ -79,19 +79,9 @@ object RemoteClient {
         // synchronous attempt to resolve the current module configuration.
         // The provider path is local and already existed on the first fetch;
         // keeping it synchronous avoids dropping the first playback request.
-        loadConfigFromLocalCache(app)
+        if (!hasResolvedConfig) loadConfigFromLocalCache(app)
         sendHandshakeAsync(app)
-
-        if (!hasResolvedConfig) {
-            val direct = fetchConfigDirect(app)
-            if (direct != null) {
-                applyResolvedConfig(app, direct)
-            } else {
-                fetchConfigAsync(app)
-            }
-        } else {
-            fetchConfigAsync(app)
-        }
+        requestConfig(app, synchronous = !hasResolvedConfig)
     }
 
     fun getContext(): Context? {
@@ -117,10 +107,14 @@ object RemoteClient {
             if (!json.isNullOrEmpty()) {
                 val saved = gson.fromJson(json, AcceleratorConfig::class.java)
                 if (saved != null) {
-                    cachedConfig = saved
-                    hasResolvedConfig = true
-                    applyDebugLogging(saved.enableDebugLogging)
-                    Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
+                    synchronized(configRefresh) {
+                        if (!hasResolvedConfig) {
+                            cachedConfig = saved
+                            hasResolvedConfig = true
+                            applyDebugLogging(saved.enableDebugLogging)
+                            Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
+                        }
+                    }
                 }
             }
         } catch (t: Throwable) {
@@ -139,31 +133,12 @@ object RemoteClient {
         get() = hasResolvedConfig
 
     fun fetchConfig(): AcceleratorConfig {
-        val now = System.currentTimeMillis()
-        val lastFetch = lastConfigFetchTime.get()
-
-        if (hasResolvedConfig && now - lastFetch < CONFIG_CACHE_TTL && lastFetch != 0L) {
-            return cachedConfig
+        if (configRefresh.isFresh(System.nanoTime())) return cachedConfig
+        val context = getContext() ?: return cachedConfig
+        // getContext() can resolve the initial configuration itself.
+        if (!configRefresh.isFresh(System.nanoTime())) {
+            requestConfig(context, synchronous = !hasResolvedConfig)
         }
-
-        val context = getContext()
-        if (context == null) {
-            return if (hasResolvedConfig) cachedConfig else AcceleratorConfig(enabled = false)
-        }
-
-        // Resolve synchronously once on cold start. Later refreshes are
-        // asynchronous and continue to use the last known good configuration.
-        if (!hasResolvedConfig) {
-            val direct = fetchConfigDirect(context)
-            if (direct != null) {
-                applyResolvedConfig(context, direct)
-                return direct
-            }
-            fetchConfigAsync(context)
-            return AcceleratorConfig(enabled = false)
-        }
-
-        fetchConfigAsync(context)
         return cachedConfig
     }
 
@@ -171,7 +146,6 @@ object RemoteClient {
         cachedConfig = config
         hasResolvedConfig = true
         applyDebugLogging(config.enableDebugLogging)
-        lastConfigFetchTime.set(System.currentTimeMillis())
         saveConfigToLocalCache(context, config)
         if (config.enabled && config.enableBtr) {
             io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.start(
@@ -220,17 +194,8 @@ object RemoteClient {
         try {
             val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
                 override fun onChange(selfChange: Boolean) {
-                    lastConfigFetchTime.set(0L)
-                    fetchConfigAsync(context) { newConfig ->
-                        if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isStarted) {
-                            io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.updateParameters(
-                                concurrency = newConfig.btrConcurrency,
-                                chunkSizeKb = newConfig.btrChunkSizeKb,
-                                autoConcurrency = newConfig.btrAutoConcurrency,
-                                autoChunkSize = newConfig.btrAutoChunkSize
-                            )
-                        }
-                    }
+                    configRefresh.invalidate()
+                    requestConfig(context)
                 }
             }
             context.contentResolver.registerContentObserver(StatsProvider.CONTENT_URI, true, observer)
@@ -240,24 +205,35 @@ object RemoteClient {
         }
     }
 
-    private fun fetchConfigAsync(context: Context, onLoaded: ((AcceleratorConfig) -> Unit)? = null) {
-        if (isFetching.compareAndSet(false, true)) {
-            configExecutor.execute {
-                try {
-                    val config = fetchConfigDirect(context)
-                    if (config != null) {
-                        applyResolvedConfig(context, config)
-                        onLoaded?.invoke(config)
-                    } else {
-                        lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
-                    }
-                } catch (t: Throwable) {
-                    Log.d(TAG, "Async config fetch exception: ${t.message}")
-                    lastConfigFetchTime.set(System.currentTimeMillis() - CONFIG_CACHE_TTL + 5_000L)
-                } finally {
-                    isFetching.set(false)
+    private fun requestConfig(context: Context, synchronous: Boolean = false) {
+        val revision = configRefresh.begin() ?: return
+        if (synchronous) {
+            readConfig(context, revision, retryInBackground = true)
+        } else {
+            configExecutor.execute { readConfig(context, revision, retryInBackground = false) }
+        }
+    }
+
+    private fun readConfig(context: Context, revision: Long, retryInBackground: Boolean) {
+        var failed = false
+        try {
+            val config = fetchConfigDirect(context)
+            if (config == null) {
+                failed = true
+            } else {
+                configRefresh.publish(revision, System.nanoTime() + configCacheNanos) {
+                    applyResolvedConfig(context, config)
                 }
             }
+        } catch (t: Throwable) {
+            failed = true
+            Log.d(TAG, "Config refresh failed: ${t.message}")
+        } finally {
+            if (failed && !retryInBackground) {
+                configRefresh.publish(revision, System.nanoTime() + configRetryNanos) {}
+            }
+            val invalidated = configRefresh.finish(revision)
+            if (invalidated || (failed && retryInBackground)) requestConfig(context)
         }
     }
 

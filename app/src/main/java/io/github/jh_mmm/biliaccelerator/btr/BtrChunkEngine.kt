@@ -38,6 +38,7 @@ object BtrChunkEngine {
 
     private const val VIDEO_PROBE_BYTES = 128 * 1024
     private const val AUDIO_PROBE_BYTES = 64 * 1024
+    private val probeSlotWaitNanos = TimeUnit.SECONDS.toNanos(2)
     private const val MAX_PREFETCH_CHUNKS = 16
     private const val MAX_MEMORY_PREFETCH_BYTES = 8 * 1024 * 1024L
     private const val MAX_PENALTY_ENTRIES = 256
@@ -127,11 +128,16 @@ object BtrChunkEngine {
             hitHosts.add(host)
         }
 
-        fun finishAndReport() {
+        fun finishAndReport(outcome: TransferOutcome, requestedBytes: Long) {
             val count = totalChunks.get()
-            if (count == 0) return
-
             val bytes = totalBytes.get()
+            val status = outcome.name.lowercase(Locale.ROOT)
+            DebugEventBuffer.record(
+                "BTR",
+                "stream-$status session=$sessionId chunks=$count bytes=$bytes cdns=${hitHosts.size} requested=$requestedBytes"
+            )
+            if (outcome != TransferOutcome.COMPLETE || count == 0) return
+
             val avgLatency = totalLatency.get() / count
             val mbStr = String.format(Locale.getDefault(), "%.1f", bytes / (1024.0 * 1024.0))
 
@@ -165,10 +171,6 @@ object BtrChunkEngine {
                 btrAvgLatencyMs = avgLatency
             )
             RemoteClient.notifyRewrite(result)
-            io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
-                "BTR",
-                "stream-complete session=$sessionId chunks=$count bytes=$bytes cdns=${hitHosts.size}"
-            )
         }
     }
 
@@ -244,6 +246,7 @@ object BtrChunkEngine {
     )
 
     private enum class PipeResult { COMPLETE, FAILED_BEFORE_RESPONSE, FAILED_AFTER_RESPONSE }
+    private enum class TransferOutcome { COMPLETE, FAILED, CANCELLED }
 
     private data class Probe(
         val totalLength: Long = -1L,
@@ -289,10 +292,11 @@ object BtrChunkEngine {
                 writeHeaders(out, 200, "OK", session.contentType, length, null, true)
                 return
             }
-            for (url in orderedUrls(fallbackCandidates, session)) {
-                val result = pipeUpstream(source, url, BtrRangeRequest.Full, head = true, out)
-                if (result != PipeResult.FAILED_BEFORE_RESPONSE) return
+            val result = firstAvailableRoute(source, fallbackCandidates) { url ->
+                pipeUpstream(source, url, BtrRangeRequest.Full, head = true, out, waitForHost = false)
+                    .takeUnless { it == PipeResult.FAILED_BEFORE_RESPONSE }
             }
+            if (result != null) return
             if (stream.isClosed) return
             // Some media CDNs accept range GETs and reject HEAD.
             val probe = probeMedia(source, fallbackCandidates, BtrRangeRequest.Full, 1, out, headOnly = true)
@@ -384,24 +388,39 @@ object BtrChunkEngine {
         )
 
         val contentRange = if (range.isPartial) "bytes ${resolved.start}-${resolved.end}/$total" else null
-        writeHeaders(out, if (range.isPartial) 206 else 200,
-            if (range.isPartial) "Partial Content" else "OK", contentType, resolved.length, contentRange, true)
+        var headersSent = false
+        fun beginResponse() {
+            if (headersSent) return
+            writeHeaders(out, if (range.isPartial) 206 else 200,
+                if (range.isPartial) "Partial Content" else "OK", contentType, resolved.length, contentRange, true)
+            headersSent = true
+        }
+
         var offset = resolved.start
+        var outcome = TransferOutcome.FAILED
         try {
             if (probeBytes != null && offset >= probe.offset && offset - probe.offset < probeBytes.size) {
                 val from = (offset - probe.offset).toInt()
                 val length = minOf((probeBytes.size - from).toLong(), resolved.length).toInt()
+                beginResponse()
                 out.write(probeBytes, from, length)
                 out.flush()
                 stats.recordChunk(probe.host, length.toLong(), probe.latency)
                 offset += length
             }
-            deliverChunks(
+            outcome = deliverChunks(
                 source.copy(excludedFallbackUrl = attemptedDirect), candidates.filterNot { it == attemptedDirect },
-                synthesized, sample, total, offset, resolved.end, activeChunkSize, caps, out, stats
+                synthesized, sample, total, offset, resolved.end, activeChunkSize, caps, out, stats, ::beginResponse
             )
+            if (!headersSent && outcome == TransferOutcome.FAILED) writeError(out, 502, "Bad Gateway")
+        } catch (error: IOException) {
+            outcome = TransferOutcome.CANCELLED
+            throw error
+        } catch (error: InterruptedException) {
+            outcome = TransferOutcome.CANCELLED
+            throw error
         } finally {
-            stats.finishAndReport()
+            stats.finishAndReport(outcome, resolved.length)
         }
     }
 
@@ -416,8 +435,9 @@ object BtrChunkEngine {
         chunkSize: Long,
         caps: BtrConcurrencyCaps,
         out: OutputStream,
-        stats: StreamStatsTracker
-    ) {
+        stats: StreamStatsTracker,
+        beginResponse: () -> Unit
+    ): TransferOutcome {
         val budget = if (source.session.isAudio) audioBudget else videoBudget
         val workers = if (source.session.isAudio) audioWorkers else videoWorkers
         val pending = ArrayDeque<PendingChunk>()
@@ -464,8 +484,9 @@ object BtrChunkEngine {
                                 BtrSessionManager.recordDirectFallback(source.session.originalUrl)
                             }
                         }
-                        break
+                        return if (source.stream.isClosed) TransferOutcome.CANCELLED else TransferOutcome.FAILED
                     }
+                    if (delivered == 0L) beginResponse()
                     out.write(chunk.bytes)
                     out.flush()
                     stats.recordChunk(chunk.host, chunk.bytes.size.toLong(), chunk.latency)
@@ -474,6 +495,7 @@ object BtrChunkEngine {
                     task.discard()
                 }
             }
+            return if (source.stream.isClosed) TransferOutcome.CANCELLED else TransferOutcome.COMPLETE
         } finally {
             // Closing the request prevents queued work from registering a late call.
             source.stream.close()
@@ -525,6 +547,32 @@ object BtrChunkEngine {
         throw IOException("Too many upstream redirects")
     }
 
+    private inline fun <T : Any> firstAvailableRoute(
+        source: SourceRequest,
+        urls: List<String>,
+        attempt: (String) -> T?
+    ): T? {
+        val waiting = orderedUrls(urls, source.session).toMutableList()
+        var waitStarted: Long? = null
+        while (waiting.isNotEmpty() && !source.stream.isClosed) {
+            val candidates = waiting.iterator()
+            while (candidates.hasNext() && !source.stream.isClosed) {
+                try {
+                    attempt(candidates.next())?.let { return it }
+                    candidates.remove()
+                } catch (_: RouteBusy) {
+                    // Try the remaining candidates before waiting for a slot.
+                }
+            }
+            if (waiting.isEmpty() || source.stream.isClosed) break
+            val now = System.nanoTime()
+            val start = waitStarted ?: now.also { waitStarted = it }
+            if (now - start >= probeSlotWaitNanos) break
+            Thread.sleep(35)
+        }
+        return null
+    }
+
     private fun probeMedia(
         source: SourceRequest,
         urls: List<String>,
@@ -536,11 +584,10 @@ object BtrChunkEngine {
         val start = range.start ?: 0L
         val end = minOf(range.end ?: Long.MAX_VALUE, start + minOf(probeSize - 1L, Long.MAX_VALUE - start))
         val client = if (source.session.isAudio) BtrHttpClient.audioStreamClient else BtrHttpClient.probeClient
-        for (url in orderedUrls(urls, source.session)) {
-            if (source.stream.isClosed) return null
+        return firstAvailableRoute(source, urls) { url ->
             var writing = false
             try {
-                execute(source, client, request(source, url, "bytes=$start-$end")) { response, begin ->
+                execute(source, client, request(source, url, "bytes=$start-$end"), waitForHost = false) { response, begin ->
                     val host = response.request.url.host
                     if (response.code == 200 && response.header("Content-Range") == null &&
                         usesIdentityEncoding(response) && response.body != null
@@ -550,12 +597,12 @@ object BtrChunkEngine {
                         writeUpstreamResponse(response, out, head = headOnly)
                         markHealthy(url)
                         DebugEventBuffer.record("BTR", "non_range_passthrough host=$host")
-                        return Probe(transferred = true)
+                        return@firstAvailableRoute Probe(transferred = true)
                     }
                     if (response.code == 416) {
                         val length = BtrHttpSafety.parseUnsatisfiedLength(response.header("Content-Range"))
                         if (length != null && (length == 0L || range.resolve(length) == null)) {
-                            return Probe(totalLength = length, contentType = response.header("Content-Type"))
+                            return@firstAvailableRoute Probe(totalLength = length, contentType = response.header("Content-Type"))
                         }
                     }
                     if (response.code != 206) {
@@ -576,15 +623,15 @@ object BtrChunkEngine {
                     markHealthy(url)
                     val elapsed = System.nanoTime() - begin
                     source.session.routeMetrics.record(url, bytes.size, elapsed)
-                    return Probe(total, response.header("Content-Type"), start, bytes, host,
+                    return@firstAvailableRoute Probe(total, response.header("Content-Type"), start, bytes, host,
                         TimeUnit.NANOSECONDS.toMillis(elapsed), sourceUrl = url)
                 }
             } catch (error: IOException) {
                 if (writing) throw error
                 handleNetworkError(source, url, error)
             }
+            null
         }
-        return null
     }
 
     private fun pipeUpstream(
@@ -592,13 +639,14 @@ object BtrChunkEngine {
         url: String,
         range: BtrRangeRequest,
         head: Boolean,
-        out: OutputStream
+        out: OutputStream,
+        waitForHost: Boolean = true
     ): PipeResult {
         if (source.stream.isClosed || source.session.isUrlRejected(url)) return PipeResult.FAILED_BEFORE_RESPONSE
         var writing = false
         return try {
             val client = if (source.session.isAudio) BtrHttpClient.audioStreamClient else BtrHttpClient.fallbackClient
-            execute(source, client, request(source, url, range.headerValue(), head)) { response, _ ->
+            execute(source, client, request(source, url, range.headerValue(), head), waitForHost) { response, _ ->
                 val contentRange = response.header("Content-Range")
                 if (response.code == 416) {
                     val length = BtrHttpSafety.parseUnsatisfiedLength(contentRange)
@@ -710,8 +758,9 @@ object BtrChunkEngine {
         val client = if (source.session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.client
         val fallback = source.session.safeFallbackUrl?.takeUnless { it == source.excludedFallbackUrl || it in urls }
         val buffer = ChunkBuffer((end - start + 1).toInt())
+        var interruptedRoute: String? = null
 
-        fun download(url: String, waitForHost: Boolean): DownloadedChunk? {
+        fun download(url: String, waitForHost: Boolean, resumeOnly: Boolean = false): DownloadedChunk? {
             if (source.stream.isClosed || source.session.isUrlRejected(url) ||
                 isHostPenalized(extractHostname(url))
             ) return null
@@ -720,6 +769,7 @@ object BtrChunkEngine {
             ) return null
 
             var tag = buffer.resumeTag()
+            if (resumeOnly && tag == null) return null
             var restartWhole: Boolean
             do {
                 restartWhole = false
@@ -759,11 +809,20 @@ object BtrChunkEngine {
                         if (prefix > 0) DebugEventBuffer.record("BTR", "chunk_resumed saved_bytes=$prefix")
                         DownloadedChunk(buffer.bytes, response.request.url.host, TimeUnit.NANOSECONDS.toMillis(elapsed))
                     }
-                    if (!restartWhole) return result
+                    if (!restartWhole || resumeOnly) return result
                     tag = null
                 } catch (error: IOException) {
-                    if (readingBody) rejectUrl(source, url, "chunk_body_interrupted")
-                    else handleNetworkError(source, url, error)
+                    if (readingBody && !source.stream.isClosed) {
+                        if (buffer.resumeTag() != null) {
+                            interruptedRoute = url
+                            DebugEventBuffer.record("BTR", "chunk_body_interrupted host=${extractHostname(url)}")
+                        } else {
+                            interruptedRoute = null
+                            rejectUrl(source, url, "chunk_body_interrupted")
+                        }
+                    } else {
+                        handleNetworkError(source, url, error)
+                    }
                     return null
                 }
             } while (restartWhole)
@@ -797,7 +856,12 @@ object BtrChunkEngine {
             if (source.stream.isClosed) return null
             download(url, waitForHost = true)?.let { return it }
         }
-        return null
+        // Preserve the partial bytes through alternate-route attempts. If none
+        // succeeds, give the interrupted route one validated tail request.
+        val retry = interruptedRoute ?: return null
+        return firstAvailableRoute(source, listOf(retry)) { url ->
+            download(url, waitForHost = false, resumeOnly = true)
+        }
     }
 
     private fun verifyCandidate(

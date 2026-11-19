@@ -527,12 +527,16 @@ object BiliAcceleratorCore {
      * Preview/trial streams can depend on player-side entitlement handling and
      * must stay on the native player path rather than entering BTR.
      */
+    private val previewFlag = Regex("""[?&](?:is_preview|preview|is_trial|trial)=1(?:&|$)""", RegexOption.IGNORE_CASE)
+
     fun isEpisodePreview(url: String): Boolean {
         if (url.isBlank()) return false
-        val lower = url.lowercase()
-        return lower.contains("is_preview=1") ||
-                lower.contains("preview=1") ||
-                lower.contains("trial=1")
+        val mediaUrl = if (url.contains("?url=") || url.contains("&url=")) {
+            unwrapRelayUrl(url) ?: url
+        } else {
+            url
+        }
+        return previewFlag.containsMatchIn(mediaUrl.substringBefore('#'))
     }
 
     private val AUDIO_REP_REGEX = Regex("""-(302\d{2}|3025\d)\.(m4s|mp4)""", RegexOption.IGNORE_CASE)
@@ -648,6 +652,9 @@ object BiliAcceleratorCore {
         val segKey = extractSegmentKey(parsed.path)
         if (hasDrmSignal(original)) {
             return noChange(original, "drm-protected", isPcdn = false, isMcdn = false, segmentKey = segKey)
+        }
+        if (isEpisodePreview(original)) {
+            return noChange(original, "episode-preview-pass", segmentKey = segKey)
         }
 
         val cleanProxyHost = resolveProxyHost(config)
@@ -829,6 +836,7 @@ object BiliAcceleratorCore {
         config: AcceleratorConfig,
         onRewrite: ((RewriteResult) -> Unit)? = null
     ): List<String> {
+        if (rawList.any(::isEpisodePreview)) return rawList
         if (!config.enabled) return rawList.distinct()
         // Live candidates are passed through unchanged. Filtering live
         // backups can remove the only URL that still has a valid signature.

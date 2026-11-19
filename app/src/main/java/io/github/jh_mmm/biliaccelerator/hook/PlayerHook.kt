@@ -168,6 +168,10 @@ object PlayerHook {
                         return@intercept chain.proceed()
                     }
 
+                    if (rawList.any(BiliAcceleratorCore::isEpisodePreview)) {
+                        return@intercept chain.proceed()
+                    }
+
                     val effectiveRelay = resolveEffectiveRelay(rawList.first(), config)
                     if (effectiveRelay.selection.allUnavailable) {
                         io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer.record(
@@ -257,17 +261,9 @@ object PlayerHook {
         if (BiliAcceleratorCore.hasDrmSignal(mediaUrl)) return null
         val isEpisode = BiliAcceleratorCore.isEpisodeMediaUrl(mediaUrl) ||
                 (result.changed && BiliAcceleratorCore.isEpisodeMediaUrl(result.finalUrl))
-        if (isEpisode) {
-            if (!config.enableEpisodeAcceleration) {
-                Log.i(TAG, "Episode acceleration disabled, leaving episode stream to native player")
-                return null
-            }
-            if (BiliAcceleratorCore.isEpisodePreview(mediaUrl) ||
-                (result.changed && BiliAcceleratorCore.isEpisodePreview(result.finalUrl))
-            ) {
-                Log.i(TAG, "Episode preview detected, leaving stream to native player")
-                return null
-            }
+        if (isEpisode && !config.enableEpisodeAcceleration) {
+            Log.i(TAG, "Episode acceleration disabled, leaving episode stream to native player")
+            return null
         }
 
         if (result.reason == "akamai-pass") return null
@@ -343,7 +339,7 @@ object PlayerHook {
         val parsed = BiliAcceleratorCore.parseUri(originalUrl)
         val isLive = parsed != null && BiliAcceleratorCore.isLiveMediaUrl(parsed.path, originalUrl)
 
-        if (isLive) {
+        if (isLive || BiliAcceleratorCore.isEpisodePreview(originalUrl)) {
             RemoteClient.notifyRewrite(BiliAcceleratorCore.rewriteUrl(originalUrl, config))
             return null
         }

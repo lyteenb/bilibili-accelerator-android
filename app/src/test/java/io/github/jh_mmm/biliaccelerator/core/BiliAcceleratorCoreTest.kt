@@ -42,6 +42,26 @@ class BiliAcceleratorCoreTest {
     }
 
     @Test
+    fun pgcPreviewKeepsPrimaryAndBackupsUnmodifiedWithEpisodeAccelerationOnOrOff() {
+        val mcdn = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?os=mcdn"
+        val preview = "$mcdn&ep_id=10&is_preview=1"
+        val wrapped = requireNotNull(BiliAcceleratorCore.parseUri(preview))
+            .proxyWrap("proxy-tf-all-hw.bilivideo.com")
+        val backups = listOf(mcdn, wrapped, wrapped)
+        for (enabled in listOf(true, false)) {
+            val config = defaultConfig.copy(enableEpisodeAcceleration = enabled, forceUpos = true)
+            for (url in listOf(preview, wrapped)) {
+                val result = BiliAcceleratorCore.rewriteUrl(url, config)
+                assertFalse(result.changed)
+                assertEquals("episode-preview-pass", result.reason)
+                assertEquals(url, result.finalUrl)
+            }
+            assertEquals(backups, BiliAcceleratorCore.filterAndFillBackupUrls(backups, config))
+            assertTrue(BiliAcceleratorCore.rewriteUrl("$mcdn&preview=10", config).changed)
+        }
+    }
+
+    @Test
     fun testMcdnProxyRelay() {
         val original = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn"
         val result = BiliAcceleratorCore.rewriteUrl(original, defaultConfig)

@@ -1,6 +1,7 @@
 package io.github.jh_mmm.biliaccelerator.btr
 
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.DebugEventBuffer
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -234,6 +235,47 @@ class BtrProxyResponseTest {
     }
 
     @Test
+    fun probeAndHeadUseAnIdleSignedBackup() {
+        val content = ByteArray(65_536) { it.toByte() }
+        val calls = mutableListOf<Pair<String, String>>()
+        BtrCallRegistry().open("held-probe-host").use { holder ->
+            val leases = List(4) {
+                requireNotNull(BtrHttpClient.acquireHost(primary.toHttpUrl().host, false, holder, wait = false))
+            }
+            try {
+                val responder: (Request) -> Response = {
+                    calls.add(it.method to it.url.toString())
+                    if (it.method == "HEAD") response(it, 200, contentLength = content.size)
+                    else rangedResponse(it, content)
+                }
+                val head = run(session(primary, listOf(backup)), head = true, responder = responder)
+                assertEquals("HTTP/1.1 200 OK", head.status)
+                assertArrayEquals(content, run(session(primary, listOf(backup)), "bytes=0-65535", responder = responder).body)
+                assertEquals(listOf("HEAD" to backup, "GET" to backup), calls)
+            } finally {
+                leases.forEach { it.close() }
+            }
+        }
+    }
+
+    @Test(timeout = 4500)
+    fun probeStopsWaitingWhenEveryCandidateIsBusy() {
+        BtrCallRegistry().open("held-only-probe-host").use { holder ->
+            val leases = List(4) {
+                requireNotNull(BtrHttpClient.acquireHost(primary.toHttpUrl().host, false, holder, wait = false))
+            }
+            try {
+                val result = run(session(primary, maxNodes = 1), "bytes=0-15") {
+                    error("The upstream slot is occupied")
+                }
+                assertEquals("HTTP/1.1 502 Bad Gateway", result.status)
+            } finally {
+                leases.forEach { it.close() }
+            }
+        }
+    }
+
+    @Test
     fun measuredRoutesLeadAndUnknownRoutesGetLimitedTrials() {
         val metrics = BtrRouteMetrics()
         val now = 1_000_000_000L
@@ -273,6 +315,72 @@ class BtrProxyResponseTest {
         assertArrayEquals(data.copyOfRange(4, 131_076), result.body)
         assertEquals(listOf("bytes=4-131075", "bytes=65540-131075"), requests.map { it.header("Range") })
         assertEquals(tag, requests.last().header("If-Range"))
+    }
+
+    @Test
+    fun singleRelayResumesTheTailOnTheSameUrl() {
+        val tag = "\"single-relay\""
+        val data = ByteArray(131_080) { (it % 241).toByte() }
+        val original = "$primary?os=mcdn"
+        val relay = wrap("proxy-tf-all-ws.bilivideo.com", original)
+        val media = session(relay, original = original, maxNodes = 1)
+        media.totalLength = data.size.toLong()
+        val requests = mutableListOf<Request>()
+        val result = run(media, "bytes=4-131075") { request ->
+            requests.add(request)
+            if (requests.size == 1) interrupted(request, data, tag)
+            else rangedResponse(request, data).newBuilder().header("ETag", tag).build()
+        }
+        assertEquals("HTTP/1.1 206 Partial Content", result.status)
+        assertArrayEquals(data.copyOfRange(4, 131_076), result.body)
+        assertEquals(listOf(relay, relay), requests.map { it.url.toString() })
+        assertEquals(listOf("bytes=4-131075", "bytes=65540-131075"), requests.map { it.header("Range") })
+        assertEquals(tag, requests.last().header("If-Range"))
+    }
+
+    @Test
+    fun invalidSingleRelayResumeFailsBeforeCommittingHeadersAndAllowsNewRequest() {
+        val data = ByteArray(131_080) { it.toByte() }
+        val original = "$primary?os=mcdn"
+        val media = session(wrap("proxy-tf-all-ws.bilivideo.com", original), original = original, maxNodes = 1)
+        media.totalLength = data.size.toLong()
+        val requests = mutableListOf<Request>()
+        val result = run(media, "bytes=4-131075") { request ->
+            requests.add(request)
+            if (requests.size == 1) interrupted(request, data, "\"original\"")
+            else rangedResponse(request, data).newBuilder().header("ETag", "\"different\"").build()
+        }
+        assertEquals("HTTP/1.1 502 Bad Gateway", result.status)
+        assertEquals(0, result.body.size)
+        assertEquals(2, requests.size)
+        assertArrayEquals(
+            data.copyOfRange(4, 131_076),
+            run(media, "bytes=4-131075") { rangedResponse(it, data) }.body
+        )
+    }
+
+    @Test
+    fun partialTransferReportsFailedWithRequestedAndDeliveredBytes() {
+        val data = ByteArray(262_144)
+        val media = session(primary, maxNodes = 1)
+        val previouslyEnabled = DebugEventBuffer.isEnabled
+        DebugEventBuffer.setEnabled(true)
+        val eventCount = DebugEventBuffer.snapshot().events.size
+        try {
+            val result = run(media, "bytes=0-262143") {
+                if (it.header("Range") == "bytes=0-131071") rangedResponse(it, data)
+                else response(it, 403)
+            }
+            assertTrue(result.headers.contains("Content-Length: 262144"))
+            assertEquals(131_072, result.body.size)
+            val events = DebugEventBuffer.snapshot().events.drop(eventCount).map { it.message }
+            assertTrue(events.any {
+                it.startsWith("stream-failed") && it.contains("bytes=131072") && it.contains("requested=262144")
+            })
+            assertFalse(events.any { it.startsWith("stream-complete") })
+        } finally {
+            DebugEventBuffer.setEnabled(previouslyEnabled)
+        }
     }
 
     @Test
