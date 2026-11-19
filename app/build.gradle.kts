@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "io.github.jh_mmm.biliaccelerator"
-    compileSdk = 34
+    compileSdk = 35
 
     val appVersionCode = 207
     val appVersionName = "2.0.0-fork.1.6"
