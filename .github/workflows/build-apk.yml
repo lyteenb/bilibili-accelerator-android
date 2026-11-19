@@ -34,12 +34,23 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up patched Temurin JDK 17
         uses: actions/setup-java@v5
         with:
-          java-version: '17'
+          # Adoptium's API uses this SemVer for Temurin 17.0.21.1+2.
+          java-version: '17.0.21+100000002'
           distribution: 'temurin'
           cache: 'gradle'
+
+      - name: Verify build JDK
+        shell: bash
+        run: |
+          version="$("$JAVA_HOME/bin/java" -version 2>&1)"
+          printf '%s\n' "$version"
+          grep -Fq 'Temurin-17.0.21.1+2' <<< "$version"
+          gradle_version="$(bash ./gradlew --version)"
+          printf '%s\n' "$gradle_version"
+          grep -Eq '^Launcher JVM:[[:space:]]+17\.0\.21\.1([[:space:]]|$)' <<< "$gradle_version"
 
       - name: Grant Execute Permission for Gradlew
         run: chmod +x gradlew
