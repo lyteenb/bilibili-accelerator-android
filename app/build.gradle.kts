@@ -8,8 +8,8 @@ android {
     namespace = "io.github.jh_mmm.biliaccelerator"
     compileSdk = 35
 
-    val appVersionCode = 207
-    val appVersionName = "2.0.0-fork.1.6"
+    val appVersionCode = 208
+    val appVersionName = "2.0.0-fork.1.7"
 
     defaultConfig {
         applicationId = "io.github.jh_mmm.biliaccelerator"
